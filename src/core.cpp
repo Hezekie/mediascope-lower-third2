@@ -1,0 +1,3496 @@
+
+#define LOG_TAG "[" PLUGIN_NAME "][core]"
+#include "core.hpp"
+
+#include <algorithm>
+#include <sstream>
+#include <random>
+#include <cctype>
+#include <mutex>
+#include <unordered_set>
+#include <unordered_map>
+
+#include <chrono>
+#include <climits>
+
+#include <QDir>
+#include <QFile>
+#include <QFileInfo>
+#include <QDateTime>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonArray>
+#include <QSaveFile>
+
+#include <obs-frontend-api.h>
+#include <obs.h>
+#include <obs-module.h>
+#include <filesystem>
+#include <system_error>
+
+namespace vflow {
+
+static std::string g_output_dir;
+static std::string g_target_browser_source;
+static std::unordered_map<std::string, std::string> g_target_browser_source_by_collection;
+static int g_target_browser_width = sltBrowserWidth;
+static int g_target_browser_height = sltBrowserHeight;
+static std::vector<lower_third_cfg> g_items;
+static std::vector<group_cfg> g_groups;
+static std::vector<std::string> g_visible;
+static std::string g_last_html_path;
+
+struct listener {
+	uint64_t token = 0;
+	core_event_cb cb = nullptr;
+	void *user = nullptr;
+};
+
+static std::mutex g_evt_mx;
+static std::vector<listener> g_listeners;
+static uint64_t g_next_token = 1;
+
+static void emit_event(const core_event &ev)
+{
+	std::vector<listener> copy;
+	{
+		std::lock_guard<std::mutex> lk(g_evt_mx);
+		copy = g_listeners;
+	}
+	for (const auto &l : copy) {
+		if (l.cb)
+			l.cb(ev, l.user);
+	}
+}
+
+uint64_t add_event_listener(core_event_cb cb, void *user)
+{
+	if (!cb)
+		return 0;
+
+	std::lock_guard<std::mutex> lk(g_evt_mx);
+	const uint64_t t = g_next_token++;
+	g_listeners.push_back(listener{t, cb, user});
+	return t;
+}
+
+void remove_event_listener(uint64_t token)
+{
+	if (token == 0)
+		return;
+
+	std::lock_guard<std::mutex> lk(g_evt_mx);
+	g_listeners.erase(std::remove_if(g_listeners.begin(), g_listeners.end(),
+					 [&](const listener &l) { return l.token == token; }),
+			  g_listeners.end());
+}
+
+static std::string join_path(const std::string &a, const std::string &b)
+{
+	QDir d(QString::fromStdString(a));
+	return d.filePath(QString::fromStdString(b)).toStdString();
+}
+
+static bool write_text_file(const std::string &path, const std::string &data)
+{
+	QFile f(QString::fromStdString(path));
+	if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+		LOGW("Failed opening '%s' for write (err=%d '%s')", path.c_str(), (int)f.error(),
+		     f.errorString().toUtf8().constData());
+		return false;
+	}
+	const qint64 written = f.write(data.data(), (qint64)data.size());
+	if (written != (qint64)data.size()) {
+		LOGW("Short write for '%s' (%lld/%lld)", path.c_str(), (long long)written, (long long)data.size());
+		f.close();
+		return false;
+	}
+	f.flush();
+	f.close();
+	return true;
+}
+
+static bool write_text_file_atomic(const std::string &path, const std::string &data)
+{
+	QSaveFile f(QString::fromStdString(path));
+	f.setDirectWriteFallback(true);
+	if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+		LOGW("Failed opening '%s' for atomic write (err=%d '%s')", path.c_str(), (int)f.error(),
+		     f.errorString().toUtf8().constData());
+		return false;
+	}
+	const qint64 written = f.write(data.data(), (qint64)data.size());
+	if (written != (qint64)data.size()) {
+		LOGW("Short atomic write for '%s' (%lld/%lld)", path.c_str(), (long long)written,
+		     (long long)data.size());
+		f.cancelWriting();
+		return false;
+	}
+	if (!f.commit()) {
+		LOGW("Commit failed for '%s' (err=%d '%s')", path.c_str(), (int)f.error(),
+		     f.errorString().toUtf8().constData());
+		return false;
+	}
+	return true;
+}
+
+static bool parse_json_object_text(const std::string &txt, QJsonObject &out)
+{
+	QJsonParseError err{};
+	const QJsonDocument doc = QJsonDocument::fromJson(QByteArray::fromStdString(txt), &err);
+	if (err.error != QJsonParseError::NoError || !doc.isObject())
+		return false;
+	out = doc.object();
+	return true;
+}
+
+static std::string read_text_file(const std::string &path)
+{
+	QFile f(QString::fromStdString(path));
+	if (!f.open(QIODevice::ReadOnly))
+		return {};
+	const QByteArray b = f.readAll();
+	f.close();
+	return std::string(b.constData(), (size_t)b.size());
+}
+
+static void ensure_dir(const std::string &dir)
+{
+	QDir().mkpath(QString::fromStdString(dir));
+}
+
+static std::string sanitize_id(const std::string &s)
+{
+	std::string out;
+	out.reserve(s.size());
+	for (char c : s) {
+		if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' ||
+		    c == '-') {
+			out.push_back(c);
+		}
+	}
+	if (out.empty())
+		out = "lt_" + now_timestamp_string();
+	return out;
+}
+
+static std::string replace_all(std::string s, const std::string &from, const std::string &to)
+{
+	if (from.empty())
+		return s;
+	size_t pos = 0;
+	while ((pos = s.find(from, pos)) != std::string::npos) {
+		s.replace(pos, from.size(), to);
+		pos += to.size();
+	}
+	return s;
+}
+
+static bool is_ident_char(char c)
+{
+	return std::isalnum((unsigned char)c) || c == '_' || c == '-';
+}
+
+static std::string normalize_ws_no_space(const std::string &s)
+{
+	std::string out;
+	out.reserve(s.size());
+	for (char c : s) {
+		if (!std::isspace((unsigned char)c))
+			out.push_back(c);
+	}
+	return out;
+}
+
+static std::string replace_whole_ident(std::string s, const std::string &from, const std::string &to)
+{
+	if (from.empty())
+		return s;
+
+	auto is_boundary = [](char c) {
+		return !is_ident_char(c);
+	};
+
+	size_t pos = 0;
+	while ((pos = s.find(from, pos)) != std::string::npos) {
+		const bool left_ok = (pos == 0) || is_boundary(s[pos - 1]);
+		const bool right_ok = (pos + from.size() >= s.size()) || is_boundary(s[pos + from.size()]);
+		if (left_ok && right_ok) {
+			s.replace(pos, from.size(), to);
+			pos += to.size();
+		} else {
+			pos += from.size();
+		}
+	}
+	return s;
+}
+
+struct extracted_keyframes {
+	std::string at_rule;
+	std::string name;
+	std::string block;
+	std::string norm;
+};
+
+static void extract_keyframes_blocks(std::string &css, std::vector<extracted_keyframes> &out)
+{
+	auto find_next = [&](size_t start) -> std::pair<size_t, std::string> {
+		const size_t p1 = css.find("@keyframes", start);
+		const size_t p2 = css.find("@-webkit-keyframes", start);
+		if (p1 == std::string::npos && p2 == std::string::npos)
+			return {std::string::npos, {}};
+		if (p2 == std::string::npos || (p1 != std::string::npos && p1 < p2))
+			return {p1, "@keyframes"};
+		return {p2, "@-webkit-keyframes"};
+	};
+
+	size_t cur = 0;
+	while (true) {
+		auto [pos, atr] = find_next(cur);
+		if (pos == std::string::npos)
+			break;
+
+		size_t nameStart = pos + atr.size();
+		while (nameStart < css.size() && std::isspace((unsigned char)css[nameStart]))
+			nameStart++;
+
+		size_t nameEnd = nameStart;
+		while (nameEnd < css.size() && is_ident_char(css[nameEnd]))
+			nameEnd++;
+
+		std::string name;
+		if (nameEnd > nameStart)
+			name = css.substr(nameStart, nameEnd - nameStart);
+
+		size_t braceOpen = css.find('{', nameEnd);
+		if (braceOpen == std::string::npos) {
+			cur = nameEnd;
+			continue;
+		}
+
+		int depth = 0;
+		size_t i = braceOpen;
+		for (; i < css.size(); i++) {
+			if (css[i] == '{')
+				depth++;
+			else if (css[i] == '}') {
+				depth--;
+				if (depth == 0) {
+					const size_t endPos = i + 1;
+					const std::string block = css.substr(pos, endPos - pos);
+
+					extracted_keyframes kf;
+					kf.at_rule = atr;
+					kf.name = name;
+					kf.block = block;
+					kf.norm = normalize_ws_no_space(block);
+
+					out.push_back(std::move(kf));
+
+					css.replace(pos, endPos - pos, "\n");
+					cur = pos;
+					break;
+				}
+			}
+		}
+
+		if (depth != 0) {
+
+			break;
+		}
+	}
+}
+
+static bool file_exists(const std::string &path)
+{
+	return QFileInfo(QString::fromStdString(path)).exists();
+}
+
+static std::string module_config_path_cached()
+{
+	static std::string cached;
+	static bool inited = false;
+	if (inited)
+		return cached;
+
+	inited = true;
+
+	char *p = obs_module_config_path("config.json");
+	if (!p)
+		return cached;
+
+	cached = p;
+	bfree(p);
+	return cached;
+}
+
+static std::string current_scene_collection_name()
+{
+	char *name = obs_frontend_get_current_scene_collection();
+	if (!name)
+		return {};
+
+	std::string out = name;
+	bfree(name);
+	return out;
+}
+
+static void load_global_config()
+{
+	const std::string pathS = module_config_path_cached();
+	if (pathS.empty())
+		return;
+
+	const QString path = QString::fromStdString(pathS);
+	QFile f(path);
+
+	if (!f.exists() || !f.open(QIODevice::ReadOnly)) {
+		LOGD("No global config at '%s' (first run ok)", path.toUtf8().constData());
+		return;
+	}
+
+	const QJsonDocument doc = QJsonDocument::fromJson(f.readAll());
+	if (!doc.isObject())
+		return;
+
+	const QJsonObject root = doc.object();
+
+	const QString out = root.value("output_dir").toString().trimmed();
+	if (!out.isEmpty()) {
+		g_output_dir = out.toStdString();
+		LOGI("Loaded output_dir: '%s'", g_output_dir.c_str());
+	}
+
+	const QString tgt = root.value("target_browser_source").toString().trimmed();
+	if (!tgt.isEmpty()) {
+		g_target_browser_source = tgt.toStdString();
+		LOGI("Loaded target_browser_source: '%s'", g_target_browser_source.c_str());
+	}
+
+	const QJsonValue perVal = root.value("scene_collection_browser_sources");
+	if (perVal.isObject()) {
+		const QJsonObject obj = perVal.toObject();
+		g_target_browser_source_by_collection.clear();
+		for (auto it = obj.begin(); it != obj.end(); ++it) {
+			const QString k = it.key().trimmed();
+			const QString v = it.value().toString().trimmed();
+			if (!k.isEmpty())
+				g_target_browser_source_by_collection[k.toStdString()] = v.toStdString();
+		}
+		if (!g_target_browser_source_by_collection.empty())
+			LOGI("Loaded scene_collection_browser_sources: %zu entries", g_target_browser_source_by_collection.size());
+	}
+
+	const int w = root.value("target_browser_width").toInt(sltBrowserWidth);
+	const int h = root.value("target_browser_height").toInt(sltBrowserHeight);
+	if (w > 0)
+		g_target_browser_width = w;
+	if (h > 0)
+		g_target_browser_height = h;
+}
+
+bool save_global_config()
+{
+	const std::string pathS = module_config_path_cached();
+	if (pathS.empty())
+		return false;
+
+	QFileInfo fi(QString::fromStdString(pathS));
+	QDir().mkpath(fi.absolutePath());
+
+	QJsonObject root;
+	root["output_dir"] = QString::fromStdString(g_output_dir);
+	root["target_browser_source"] = QString::fromStdString(g_target_browser_source);
+	{
+		QJsonObject per;
+		for (const auto &kv : g_target_browser_source_by_collection) {
+			if (!kv.first.empty())
+				per[QString::fromStdString(kv.first)] = QString::fromStdString(kv.second);
+		}
+		if (!per.isEmpty())
+			root["scene_collection_browser_sources"] = per;
+	}
+	root["target_browser_width"] = g_target_browser_width;
+	root["target_browser_height"] = g_target_browser_height;
+
+	const QJsonDocument doc(root);
+	return write_text_file(pathS, doc.toJson(QJsonDocument::Compact).toStdString());
+}
+
+static std::string bundle_styles_name(const std::string &)
+{
+	return "lt.css";
+}
+static std::string bundle_scripts_name(const std::string &)
+{
+	return "lt.js";
+}
+
+static std::string bundle_html_name_current()
+{
+	return "lt.html";
+}
+
+static std::string bundle_styles_path(const std::string &ts)
+{
+	return has_output_dir() ? join_path(output_dir(), bundle_styles_name(ts)) : std::string();
+}
+
+static std::string bundle_scripts_path(const std::string &ts)
+{
+	return has_output_dir() ? join_path(output_dir(), bundle_scripts_name(ts)) : std::string();
+}
+
+static std::string bundle_html_current_path()
+{
+	return has_output_dir() ? join_path(output_dir(), bundle_html_name_current()) : std::string();
+}
+
+static std::string default_js_template()
+{
+	return R"JS(
+  console.log("LT template running for", root.id || "(no-id)");
+
+  function waitForAnimationEnd(target, name, fallbackMs = 2500) {
+    return new Promise((resolve) => {
+      let done = false;
+
+      const cleanup = () => {
+        if (done) return;
+        done = true;
+        target.removeEventListener("animationend", onEnd, true);
+      };
+
+      const onEnd = (ev) => {
+        if (ev.target !== target) return;
+        if (name && ev.animationName !== name) return;
+        cleanup();
+        resolve();
+      };
+
+      target.addEventListener("animationend", onEnd, true);
+
+      setTimeout(() => {
+        cleanup();
+        resolve();
+      }, fallbackMs);
+    });
+  }
+
+  root.__slt_show = function () {
+    // Do your custom animation in stuff here
+  };
+
+  root.__slt_hide = function () {
+	// Do your custom animation out stuff here
+    return waitForAnimationEnd(root, "", 3000);
+  };
+)JS";
+}
+
+// ---------------------------------------------------------------------------
+// Built-in style gallery.
+//
+// Each entry is a complete, self-contained visual style: its own HTML/CSS,
+// its own default entrance/exit animation pairing (animate.css classes), a
+// suggested font, and a starting palette. All of them still honor
+// {{PROFILE_PICTURE_URL}} for a logo/headshot, {{FONT_FAMILY}} for the font
+// picker, and every color/size placeholder -- so anything picked here stays
+// fully editable afterward in the template editor.
+// ---------------------------------------------------------------------------
+
+struct style_meta {
+	std::string key;
+	std::string display_name;
+};
+
+static const std::vector<style_meta> &style_catalog()
+{
+	static const std::vector<style_meta> kCatalog = {
+		{"classic_card", "Classic Card"},
+		{"minimal_bar", "Minimal Bar"},
+		{"glass_panel", "Glass Panel"},
+		{"news_ribbon", "News Ribbon"},
+		{"gradient_wave", "Gradient Wave"},
+		{"neon_outline", "Neon Outline"},
+		{"corner_tag", "Corner Tag"},
+		{"split_duo", "Split Duo"},
+	};
+	return kCatalog;
+}
+
+int style_template_count()
+{
+	return (int)style_catalog().size();
+}
+
+std::string style_template_name(int index)
+{
+	const auto &cat = style_catalog();
+	if (index < 0 || index >= (int)cat.size())
+		return "Classic Card";
+	return cat[(size_t)index].display_name;
+}
+
+static lower_third_cfg default_cfg()
+{
+	lower_third_cfg c;
+	c.id = new_id();
+	c.label = "Lower Third Label";
+	c.order = 0;
+	c.title = "New Lower Third";
+	c.subtitle = "Subtitle";
+	c.profile_picture.clear();
+	c.anim_in_sound.clear();
+	c.anim_out_sound.clear();
+
+	c.title_size = 46;
+	c.subtitle_size = 24;
+
+	c.avatar_width = 100;
+	c.avatar_height = 100;
+
+	c.anim_in = "animate__fadeInUp";
+	c.anim_out = "animate__fadeOutDown";
+
+	c.font_family = "Inter";
+	c.lt_position = "lt-pos-bottom-left";
+
+	c.primary_color = "#111827";
+	c.secondary_color = "#1F2937";
+	c.title_color = "#F9FAFB";
+	c.subtitle_color = "#D1D5DB";
+	c.opacity = 85;
+	c.radius = 5;
+
+	c.html_template =
+		R"HTML(
+<div class="slt-card" data-slt-root>
+  <div class="slt-bg" aria-hidden="true"></div>
+
+  <div class="slt-content">
+    <div class="slt-left">
+      <img class="slt-avatar" src="{{PROFILE_PICTURE_URL}}" alt="" onerror="this.style.display='none'">
+    </div>
+
+    <div class="slt-right">
+      <div class="slt-title">{{TITLE}}</div>
+      <div class="slt-subtitle">{{SUBTITLE}}</div>
+    </div>
+  </div>
+</div>
+)HTML";
+
+	c.css_template =
+		R"CSS(
+.slt-card {
+  position: relative;
+  display: inline-block;
+  border-radius: {{RADIUS}}px;
+  box-shadow: 0 10px 30px rgba(0,0,0,0.35);
+  font-family: {{FONT_FAMILY}}, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+}
+
+.slt-bg {
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: linear-gradient(135deg, {{PRIMARY_COLOR}}, {{SECONDARY_COLOR}});
+  opacity: calc({{OPACITY}} / 100);
+  pointer-events: none;
+}
+
+.slt-content {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 18px;
+}
+
+.slt-avatar {
+  width: {{AVATAR_WIDTH}}px;
+  height: {{AVATAR_HEIGHT}}px;
+  border-radius: 50%;
+  object-fit: cover;
+  background: rgba(255,255,255,0.08);
+  flex-shrink: 0;
+}
+
+.slt-avatar:not([src]),
+.slt-avatar[src=""],
+.slt-avatar[src="./"] {
+  display: none !important;
+}
+
+.slt-title {
+  font-weight: 700;
+  font-size: {{TITLE_SIZE}}px;
+  line-height: 1.1;
+  color: {{TITLE_COLOR}};
+}
+
+.slt-subtitle {
+  opacity: 0.9;
+  font-size: {{SUBTITLE_SIZE}}px;
+  margin-top: 2px;
+  color: {{SUBTITLE_COLOR}};
+}
+)CSS";
+
+	c.js_template = default_js_template();
+
+	c.repeat_every_sec = 0;
+	c.repeat_visible_sec = 0;
+	c.hotkey.clear();
+	return c;
+}
+
+// Returns a fully-configured lower-third preset for the given style index.
+// Falls back to the classic card (index 0) for anything out of range.
+static lower_third_cfg style_variant(int index)
+{
+	lower_third_cfg c = default_cfg();
+	c.js_template = default_js_template();
+
+	switch (index) {
+	case 0: // Classic Card -- the original design, kept as the baseline.
+		break;
+
+	case 1: { // Minimal Bar -- thin horizontal strip, accent edge, no bubble avatar.
+		c.anim_in = "animate__slideInLeft";
+		c.anim_out = "animate__slideOutLeft";
+		c.font_family = "Oswald";
+		c.primary_color = "#0F172A";
+		c.secondary_color = "#0F172A";
+		c.title_color = "#FFFFFF";
+		c.subtitle_color = "#93C5FD";
+		c.radius = 2;
+		c.avatar_width = 64;
+		c.avatar_height = 64;
+		c.html_template = R"HTML(
+<div class="slt-card slt-minimal" data-slt-root>
+  <div class="slt-accent" aria-hidden="true"></div>
+  <div class="slt-bg" aria-hidden="true"></div>
+  <div class="slt-content">
+    <img class="slt-avatar" src="{{PROFILE_PICTURE_URL}}" alt="" onerror="this.style.display='none'">
+    <div class="slt-text">
+      <div class="slt-title">{{TITLE}}</div>
+      <div class="slt-subtitle">{{SUBTITLE}}</div>
+    </div>
+  </div>
+</div>
+)HTML";
+		c.css_template = R"CSS(
+.slt-minimal {
+  position: relative;
+  display: inline-flex;
+  border-radius: {{RADIUS}}px;
+  overflow: hidden;
+  font-family: {{FONT_FAMILY}}, system-ui, sans-serif;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.35);
+}
+.slt-minimal .slt-accent {
+  position: absolute; inset: 0 auto 0 0; width: 5px;
+  background: {{SUBTITLE_COLOR}};
+}
+.slt-minimal .slt-bg {
+  position: absolute; inset: 0; background: {{PRIMARY_COLOR}};
+  opacity: calc({{OPACITY}} / 100);
+}
+.slt-minimal .slt-content {
+  position: relative; z-index: 1; display: flex; align-items: center;
+  gap: 10px; padding: 10px 18px 10px 14px;
+}
+.slt-minimal .slt-avatar {
+  width: {{AVATAR_WIDTH}}px; height: {{AVATAR_HEIGHT}}px; border-radius: 6px;
+  object-fit: cover; flex-shrink: 0;
+}
+.slt-minimal .slt-avatar:not([src]), .slt-minimal .slt-avatar[src=""], .slt-minimal .slt-avatar[src="./"] {
+  display: none !important;
+}
+.slt-minimal .slt-title {
+  font-weight: 700; letter-spacing: .04em; text-transform: uppercase;
+  font-size: {{TITLE_SIZE}}px; line-height: 1.05; color: {{TITLE_COLOR}};
+}
+.slt-minimal .slt-subtitle {
+  font-size: {{SUBTITLE_SIZE}}px; margin-top: 2px; color: {{SUBTITLE_COLOR}};
+}
+)CSS";
+		break;
+	}
+
+	case 2: { // Glass Panel -- frosted blur card, avatar centered on top.
+		c.anim_in = "animate__zoomIn";
+		c.anim_out = "animate__zoomOut";
+		c.font_family = "Manrope";
+		c.primary_color = "#FFFFFF";
+		c.secondary_color = "#FFFFFF";
+		c.title_color = "#0F172A";
+		c.subtitle_color = "#334155";
+		c.opacity = 55;
+		c.radius = 18;
+		c.avatar_width = 84;
+		c.avatar_height = 84;
+		c.html_template = R"HTML(
+<div class="slt-card slt-glass" data-slt-root>
+  <div class="slt-bg" aria-hidden="true"></div>
+  <div class="slt-content">
+    <img class="slt-avatar" src="{{PROFILE_PICTURE_URL}}" alt="" onerror="this.style.display='none'">
+    <div class="slt-text">
+      <div class="slt-title">{{TITLE}}</div>
+      <div class="slt-subtitle">{{SUBTITLE}}</div>
+    </div>
+  </div>
+</div>
+)HTML";
+		c.css_template = R"CSS(
+.slt-glass {
+  position: relative; display: inline-block; border-radius: {{RADIUS}}px;
+  font-family: {{FONT_FAMILY}}, system-ui, sans-serif;
+  box-shadow: 0 20px 40px rgba(0,0,0,0.25);
+}
+.slt-glass .slt-bg {
+  position: absolute; inset: 0; border-radius: inherit;
+  background: {{PRIMARY_COLOR}}; opacity: calc({{OPACITY}} / 100);
+  backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+  border: 1px solid rgba(255,255,255,0.45);
+}
+.slt-glass .slt-content {
+  position: relative; z-index: 1; display: flex; align-items: center;
+  gap: 14px; padding: 16px 22px;
+}
+.slt-glass .slt-avatar {
+  width: {{AVATAR_WIDTH}}px; height: {{AVATAR_HEIGHT}}px; border-radius: 50%;
+  object-fit: cover; flex-shrink: 0; border: 2px solid rgba(255,255,255,0.8);
+}
+.slt-glass .slt-avatar:not([src]), .slt-glass .slt-avatar[src=""], .slt-glass .slt-avatar[src="./"] {
+  display: none !important;
+}
+.slt-glass .slt-title {
+  font-weight: 800; font-size: {{TITLE_SIZE}}px; line-height: 1.1; color: {{TITLE_COLOR}};
+}
+.slt-glass .slt-subtitle {
+  font-size: {{SUBTITLE_SIZE}}px; margin-top: 2px; color: {{SUBTITLE_COLOR}};
+}
+)CSS";
+		break;
+	}
+
+	case 3: { // News Ribbon -- angled flag/ribbon badge, bold color block.
+		c.anim_in = "animate__flipInX";
+		c.anim_out = "animate__flipOutX";
+		c.font_family = "Bebas Neue";
+		c.primary_color = "#B91C1C";
+		c.secondary_color = "#111827";
+		c.title_color = "#FFFFFF";
+		c.subtitle_color = "#F3F4F6";
+		c.radius = 4;
+		c.avatar_width = 76;
+		c.avatar_height = 76;
+		c.html_template = R"HTML(
+<div class="slt-card slt-ribbon" data-slt-root>
+  <div class="slt-flag" aria-hidden="true"></div>
+  <div class="slt-content">
+    <img class="slt-avatar" src="{{PROFILE_PICTURE_URL}}" alt="" onerror="this.style.display='none'">
+    <div class="slt-text">
+      <div class="slt-title">{{TITLE}}</div>
+      <div class="slt-subtitle-wrap"><span class="slt-subtitle">{{SUBTITLE}}</span></div>
+    </div>
+  </div>
+</div>
+)HTML";
+		c.css_template = R"CSS(
+.slt-ribbon {
+  position: relative; display: inline-block; font-family: {{FONT_FAMILY}}, system-ui, sans-serif;
+}
+.slt-ribbon .slt-flag {
+  position: absolute; inset: 0; background: {{PRIMARY_COLOR}};
+  opacity: calc({{OPACITY}} / 100); border-radius: {{RADIUS}}px;
+  clip-path: polygon(0 0, 100% 0, 96% 100%, 0% 100%);
+}
+.slt-ribbon .slt-content {
+  position: relative; z-index: 1; display: flex; align-items: center;
+  gap: 12px; padding: 12px 30px 12px 16px;
+}
+.slt-ribbon .slt-avatar {
+  width: {{AVATAR_WIDTH}}px; height: {{AVATAR_HEIGHT}}px; border-radius: 4px;
+  object-fit: cover; flex-shrink: 0;
+}
+.slt-ribbon .slt-avatar:not([src]), .slt-ribbon .slt-avatar[src=""], .slt-ribbon .slt-avatar[src="./"] {
+  display: none !important;
+}
+.slt-ribbon .slt-title {
+  font-weight: 700; letter-spacing: .03em; font-size: {{TITLE_SIZE}}px;
+  line-height: 1; color: {{TITLE_COLOR}};
+}
+.slt-ribbon .slt-subtitle-wrap { margin-top: 4px; }
+.slt-ribbon .slt-subtitle {
+  font-size: {{SUBTITLE_SIZE}}px; color: {{SUBTITLE_COLOR}};
+  background: {{SECONDARY_COLOR}}; padding: 2px 8px; border-radius: 3px;
+}
+)CSS";
+		break;
+	}
+
+	case 4: { // Gradient Wave -- diagonal wave shape, avatar on the right.
+		c.anim_in = "animate__bounceInUp";
+		c.anim_out = "animate__bounceOutDown";
+		c.font_family = "Sora";
+		c.primary_color = "#7C3AED";
+		c.secondary_color = "#EC4899";
+		c.title_color = "#FFFFFF";
+		c.subtitle_color = "#FDE7FF";
+		c.radius = 14;
+		c.avatar_width = 90;
+		c.avatar_height = 90;
+		c.html_template = R"HTML(
+<div class="slt-card slt-wave" data-slt-root>
+  <div class="slt-bg" aria-hidden="true"></div>
+  <div class="slt-content">
+    <div class="slt-text">
+      <div class="slt-title">{{TITLE}}</div>
+      <div class="slt-subtitle">{{SUBTITLE}}</div>
+    </div>
+    <img class="slt-avatar" src="{{PROFILE_PICTURE_URL}}" alt="" onerror="this.style.display='none'">
+  </div>
+</div>
+)HTML";
+		c.css_template = R"CSS(
+.slt-wave {
+  position: relative; display: inline-block; border-radius: {{RADIUS}}px; overflow: hidden;
+  font-family: {{FONT_FAMILY}}, system-ui, sans-serif;
+  box-shadow: 0 14px 34px rgba(124,58,237,0.35);
+}
+.slt-wave .slt-bg {
+  position: absolute; inset: 0;
+  background: linear-gradient(120deg, {{PRIMARY_COLOR}}, {{SECONDARY_COLOR}});
+  opacity: calc({{OPACITY}} / 100);
+}
+.slt-wave .slt-content {
+  position: relative; z-index: 1; display: flex; align-items: center;
+  gap: 14px; padding: 14px 18px;
+}
+.slt-wave .slt-avatar {
+  width: {{AVATAR_WIDTH}}px; height: {{AVATAR_HEIGHT}}px; border-radius: 50%;
+  object-fit: cover; flex-shrink: 0; border: 3px solid rgba(255,255,255,0.65);
+}
+.slt-wave .slt-avatar:not([src]), .slt-wave .slt-avatar[src=""], .slt-wave .slt-avatar[src="./"] {
+  display: none !important;
+}
+.slt-wave .slt-title {
+  font-weight: 800; font-size: {{TITLE_SIZE}}px; line-height: 1.1; color: {{TITLE_COLOR}};
+}
+.slt-wave .slt-subtitle {
+  font-size: {{SUBTITLE_SIZE}}px; margin-top: 2px; color: {{SUBTITLE_COLOR}};
+}
+)CSS";
+		break;
+	}
+
+	case 5: { // Neon Outline -- dark card, glowing border, techy font.
+		c.anim_in = "animate__lightSpeedInRight";
+		c.anim_out = "animate__lightSpeedOutLeft";
+		c.font_family = "JetBrains Mono";
+		c.primary_color = "#020617";
+		c.secondary_color = "#020617";
+		c.title_color = "#22D3EE";
+		c.subtitle_color = "#67E8F9";
+		c.radius = 8;
+		c.avatar_width = 72;
+		c.avatar_height = 72;
+		c.html_template = R"HTML(
+<div class="slt-card slt-neon" data-slt-root>
+  <div class="slt-bg" aria-hidden="true"></div>
+  <div class="slt-content">
+    <img class="slt-avatar" src="{{PROFILE_PICTURE_URL}}" alt="" onerror="this.style.display='none'">
+    <div class="slt-text">
+      <div class="slt-title">{{TITLE}}</div>
+      <div class="slt-subtitle">{{SUBTITLE}}</div>
+    </div>
+  </div>
+</div>
+)HTML";
+		c.css_template = R"CSS(
+.slt-neon {
+  position: relative; display: inline-block; border-radius: {{RADIUS}}px;
+  font-family: {{FONT_FAMILY}}, ui-monospace, monospace;
+}
+.slt-neon .slt-bg {
+  position: absolute; inset: 0; border-radius: inherit;
+  background: {{PRIMARY_COLOR}}; opacity: calc({{OPACITY}} / 100);
+  border: 1.5px solid {{TITLE_COLOR}};
+  box-shadow: 0 0 10px {{TITLE_COLOR}}, inset 0 0 12px rgba(34,211,238,0.25);
+}
+.slt-neon .slt-content {
+  position: relative; z-index: 1; display: flex; align-items: center;
+  gap: 12px; padding: 12px 18px;
+}
+.slt-neon .slt-avatar {
+  width: {{AVATAR_WIDTH}}px; height: {{AVATAR_HEIGHT}}px; border-radius: 6px;
+  object-fit: cover; flex-shrink: 0; filter: saturate(1.1);
+}
+.slt-neon .slt-avatar:not([src]), .slt-neon .slt-avatar[src=""], .slt-neon .slt-avatar[src="./"] {
+  display: none !important;
+}
+.slt-neon .slt-title {
+  font-weight: 700; font-size: {{TITLE_SIZE}}px; line-height: 1.1; color: {{TITLE_COLOR}};
+  text-shadow: 0 0 8px rgba(34,211,238,0.65);
+}
+.slt-neon .slt-subtitle {
+  font-size: {{SUBTITLE_SIZE}}px; margin-top: 2px; color: {{SUBTITLE_COLOR}};
+}
+)CSS";
+		break;
+	}
+
+	case 6: { // Corner Tag -- compact name-tag badge, quick pop-in.
+		c.anim_in = "animate__backInDown";
+		c.anim_out = "animate__backOutUp";
+		c.font_family = "Poppins";
+		c.primary_color = "#F59E0B";
+		c.secondary_color = "#F59E0B";
+		c.title_color = "#1C1917";
+		c.subtitle_color = "#451A03";
+		c.radius = 10;
+		c.avatar_width = 56;
+		c.avatar_height = 56;
+		c.html_template = R"HTML(
+<div class="slt-card slt-tag" data-slt-root>
+  <div class="slt-bg" aria-hidden="true"></div>
+  <div class="slt-content">
+    <img class="slt-avatar" src="{{PROFILE_PICTURE_URL}}" alt="" onerror="this.style.display='none'">
+    <div class="slt-text">
+      <div class="slt-title">{{TITLE}}</div>
+      <div class="slt-subtitle">{{SUBTITLE}}</div>
+    </div>
+  </div>
+</div>
+)HTML";
+		c.css_template = R"CSS(
+.slt-tag {
+  position: relative; display: inline-block; border-radius: {{RADIUS}}px;
+  font-family: {{FONT_FAMILY}}, system-ui, sans-serif;
+  box-shadow: 0 6px 18px rgba(0,0,0,0.28);
+}
+.slt-tag .slt-bg {
+  position: absolute; inset: 0; border-radius: inherit;
+  background: {{PRIMARY_COLOR}}; opacity: calc({{OPACITY}} / 100);
+}
+.slt-tag .slt-content {
+  position: relative; z-index: 1; display: flex; align-items: center;
+  gap: 8px; padding: 8px 14px 8px 8px;
+}
+.slt-tag .slt-avatar {
+  width: {{AVATAR_WIDTH}}px; height: {{AVATAR_HEIGHT}}px; border-radius: 50%;
+  object-fit: cover; flex-shrink: 0; border: 2px solid rgba(0,0,0,0.15);
+}
+.slt-tag .slt-avatar:not([src]), .slt-tag .slt-avatar[src=""], .slt-tag .slt-avatar[src="./"] {
+  display: none !important;
+}
+.slt-tag .slt-title {
+  font-weight: 700; font-size: {{TITLE_SIZE}}px; line-height: 1.05; color: {{TITLE_COLOR}};
+}
+.slt-tag .slt-subtitle {
+  font-size: {{SUBTITLE_SIZE}}px; color: {{SUBTITLE_COLOR}};
+}
+)CSS";
+		break;
+	}
+
+	case 7: { // Split Duo -- two-tone split panel, name block + role block.
+		c.anim_in = "animate__jackInTheBox";
+		c.anim_out = "animate__fadeOutDown";
+		c.font_family = "Space Grotesk";
+		c.primary_color = "#111827";
+		c.secondary_color = "#10B981";
+		c.title_color = "#FFFFFF";
+		c.subtitle_color = "#022C22";
+		c.radius = 6;
+		c.avatar_width = 80;
+		c.avatar_height = 80;
+		c.html_template = R"HTML(
+<div class="slt-card slt-split" data-slt-root>
+  <div class="slt-content">
+    <img class="slt-avatar" src="{{PROFILE_PICTURE_URL}}" alt="" onerror="this.style.display='none'">
+    <div class="slt-half slt-half-a"><span class="slt-title">{{TITLE}}</span></div>
+    <div class="slt-half slt-half-b"><span class="slt-subtitle">{{SUBTITLE}}</span></div>
+  </div>
+</div>
+)HTML";
+		c.css_template = R"CSS(
+.slt-split {
+  position: relative; display: inline-block; border-radius: {{RADIUS}}px; overflow: hidden;
+  font-family: {{FONT_FAMILY}}, system-ui, sans-serif;
+  box-shadow: 0 10px 26px rgba(0,0,0,0.3);
+}
+.slt-split .slt-content { position: relative; display: flex; align-items: stretch; }
+.slt-split .slt-avatar {
+  width: {{AVATAR_WIDTH}}px; height: {{AVATAR_HEIGHT}}px; object-fit: cover;
+  flex-shrink: 0; align-self: center; margin: 0 4px 0 8px; border-radius: 8px;
+}
+.slt-split .slt-avatar:not([src]), .slt-split .slt-avatar[src=""], .slt-split .slt-avatar[src="./"] {
+  display: none !important;
+}
+.slt-split .slt-half { display: flex; align-items: center; padding: 12px 18px; }
+.slt-split .slt-half-a { background: {{PRIMARY_COLOR}}; opacity: calc({{OPACITY}} / 100); }
+.slt-split .slt-half-b { background: {{SECONDARY_COLOR}}; }
+.slt-split .slt-title {
+  font-weight: 700; font-size: {{TITLE_SIZE}}px; color: {{TITLE_COLOR}};
+}
+.slt-split .slt-subtitle {
+  font-weight: 600; font-size: {{SUBTITLE_SIZE}}px; color: {{SUBTITLE_COLOR}};
+}
+)CSS";
+		break;
+	}
+
+	default:
+		break;
+	}
+
+	return c;
+}
+
+static std::string resolve_in_class(const lower_third_cfg &c)
+{
+	if (c.anim_in == "custom_handled_in")
+		return std::string();
+	return c.anim_in;
+}
+
+static std::string resolve_out_class(const lower_third_cfg &c)
+{
+	if (c.anim_out == "custom_handled_out")
+		return std::string();
+	return c.anim_out;
+}
+
+using slt_repl_map = std::unordered_map<std::string, std::string>;
+
+static slt_repl_map build_placeholder_map(const lower_third_cfg &c)
+{
+	slt_repl_map m;
+	m.reserve(32);
+	m["{{ID}}"] = c.id;
+	m["{{PRIMARY_COLOR}}"] = c.primary_color;
+	m["{{SECONDARY_COLOR}}"] = c.secondary_color;
+	m["{{TITLE_COLOR}}"] = c.title_color;
+	m["{{SUBTITLE_COLOR}}"] = c.subtitle_color;
+	m["{{TITLE}}"] = c.title;
+	m["{{SUBTITLE}}"] = c.subtitle;
+	m["{{OPACITY}}"] = std::to_string(c.opacity);
+	m["{{RADIUS}}"] = std::to_string(c.radius);
+	m["{{FONT_FAMILY}}"] = c.font_family.empty() ? "Inter" : c.font_family;
+	m["{{TITLE_SIZE}}"] = std::to_string(c.title_size);
+	m["{{SUBTITLE_SIZE}}"] = std::to_string(c.subtitle_size);
+	m["{{AVATAR_WIDTH}}"] = std::to_string(c.avatar_width);
+	m["{{AVATAR_HEIGHT}}"] = std::to_string(c.avatar_height);
+	m["{{ANIM_IN}}"] = c.anim_in;
+	m["{{ANIM_OUT}}"] = c.anim_out;
+	const std::string pic = c.profile_picture.empty() ? "./" : ("./" + c.profile_picture);
+	m["{{PROFILE_PICTURE_URL}}"] = pic;
+	const std::string sIn = c.anim_in_sound.empty() ? "" : ("./" + c.anim_in_sound);
+	const std::string sOut = c.anim_out_sound.empty() ? "" : ("./" + c.anim_out_sound);
+	m["{{SOUND_IN_URL}}"] = sIn;
+	m["{{SOUND_OUT_URL}}"] = sOut;
+	m["{{BG_COLOR}}"] = c.primary_color;
+	m["{{TEXT_COLOR}}"] = c.title_color;
+	return m;
+}
+
+static std::string replace_placeholders(std::string s, const slt_repl_map &m)
+{
+	std::vector<std::pair<std::string, std::string>> kv;
+	kv.reserve(m.size());
+	for (const auto &it : m)
+		kv.emplace_back(it.first, it.second);
+	std::sort(kv.begin(), kv.end(), [](const auto &a, const auto &b) { return a.first.size() > b.first.size(); });
+	for (const auto &it : kv)
+		s = replace_all(s, it.first, it.second);
+	return s;
+}
+
+static std::string build_shared_css()
+{
+	return R"CSS(
+/* MediaScope Lower Thirds - Base */
+:root{ --slt-safe-margin: 40px; --slt-z: 9999; }
+html,body{ margin:0; padding:0; background:transparent; overflow:hidden; }
+#slt-root{
+    position:fixed; inset:0;
+    margin:0; padding:0; list-style:none;
+    pointer-events:none;
+    z-index: var(--slt-z);
+}
+#slt-root > li{
+    position:absolute;
+    display: none; /* Start completely hidden */
+    pointer-events:none;
+}
+/* These ensure the display property is toggled correctly */
+.slt-visible { display: block !important; }
+.slt-hidden  { display: none !important; }
+)CSS";
+}
+
+static inline std::string ltrim_copy(std::string s)
+{
+	s.erase(s.begin(), std::find_if(s.begin(), s.end(),
+				       [](unsigned char ch) { return !std::isspace(ch); }));
+	return s;
+}
+
+static inline std::string rtrim_copy(std::string s)
+{
+	s.erase(std::find_if(s.rbegin(), s.rend(),
+			     [](unsigned char ch) { return !std::isspace(ch); })
+			.base(),
+		s.end());
+	return s;
+}
+
+static inline bool contains_id(const std::string &s, const std::string &id)
+{
+	return s.find("#" + id) != std::string::npos;
+}
+
+static inline std::string scope_selector_part_best_effort(std::string part, const std::string &id)
+{
+	const auto orig = part;
+	auto trimmed = ltrim_copy(part);
+
+	if (contains_id(trimmed, id))
+		return orig;
+
+	if (trimmed.find('&') != std::string::npos) {
+		std::string replaced = trimmed;
+		const std::string needle = "&";
+		const std::string rep = "#" + id;
+
+		size_t pos = 0;
+		while ((pos = replaced.find(needle, pos)) != std::string::npos) {
+			replaced.replace(pos, needle.size(), rep);
+			pos += rep.size();
+		}
+
+		const auto lead_len = orig.size() - ltrim_copy(orig).size();
+		return orig.substr(0, lead_len) + replaced;
+	}
+
+	const auto lead_len = orig.size() - ltrim_copy(orig).size();
+	return orig.substr(0, lead_len) + "#" + id + " " + trimmed;
+}
+
+static std::string scope_css_best_effort(const lower_third_cfg &c)
+{
+	std::string css = c.css_template;
+
+	const auto repl = build_placeholder_map(c);
+	css = replace_placeholders(std::move(css), repl);
+
+	if (css.find("#" + c.id) != std::string::npos) {
+		return "/* ---- " + c.id + " ---- */\n" + css + "\n";
+	}
+
+	std::stringstream in(css);
+	std::string line;
+	std::string out;
+	out += "/* ---- " + c.id + " ---- */\n";
+
+	while (std::getline(in, line)) {
+		std::string trimmed = ltrim_copy(line);
+
+		const bool isAt = (!trimmed.empty() && trimmed[0] == '@');
+
+		if (!isAt && line.find('{') != std::string::npos) {
+			const auto pos = line.find('{');
+			std::string sel = line.substr(0, pos);
+			std::string rest = line.substr(pos);
+
+			std::stringstream ss(sel);
+			std::string part;
+			std::string newSel;
+			bool first = true;
+
+			while (std::getline(ss, part, ',')) {
+				part = rtrim_copy(part); 
+				part = scope_selector_part_best_effort(part, c.id);
+
+				if (!first)
+					newSel += ",";
+				newSel += part;
+				first = false;
+			}
+
+			out += newSel + rest + "\n";
+		} else {
+			out += line + "\n";
+		}
+	}
+
+	return out;
+}
+
+static std::string build_base_script(const std::vector<lower_third_cfg> &items)
+{
+	std::string map = "{\n";
+	for (const auto &c : items) {
+		const bool inCustom = (c.anim_in == "custom_handled_in");
+		const bool outCustom = (c.anim_out == "custom_handled_out");
+
+		const std::string inCls = inCustom ? std::string() : c.anim_in;
+		const std::string outCls = outCustom ? std::string() : c.anim_out;
+
+		const std::string inSound = c.anim_in_sound.empty() ? std::string() : ("./" + c.anim_in_sound);
+		const std::string outSound = c.anim_out_sound.empty() ? std::string() : ("./" + c.anim_out_sound);
+		const bool bridgeEnabled = c.api_bridge_enabled;
+		const std::string paramsFile = bridgeEnabled ? ("./parameters_" + c.id + ".json") : std::string();
+
+		int delay = 0;
+
+		map += "  \"" + c.id +
+		       "\": { "
+		       "inCustom: " +
+		       std::string(inCustom ? "true" : "false") +
+		       ", "
+		       "outCustom: " +
+		       std::string(outCustom ? "true" : "false") +
+		       ", "
+		       "inCls: " +
+		       (inCls.empty() ? "null" : ("\"" + inCls + "\"")) +
+		       ", "
+		       "outCls: " +
+		       (outCls.empty() ? "null" : ("\"" + outCls + "\"")) +
+		       ", "
+		       "inSound: " +
+		       (inSound.empty() ? "null" : ("\"" + inSound + "\"")) +
+		       ", "
+		       "outSound: " +
+		       (outSound.empty() ? "null" : ("\"" + outSound + "\"")) +
+		       ", "
+		       "paramsFile: " +
+		       (paramsFile.empty() ? "null" : ("\"" + paramsFile + "\"")) +
+		       ", "
+		       "delay: " +
+		       std::to_string(delay) + " },\n";
+	}
+	map += "};\n";
+
+	return std::string(R"JS(
+/* MediaScope Lower Thirds – Base Animation Script (simple polling + per-item transition lock) */
+(() => {
+  const VISIBLE_URL = "./lt-visible.json";
+  const PARAMS_URL  = "./parameters.json";
+  const animMap = )JS") +
+	       map + std::string(R"JS(
+  // Safety bounds (avoid deadlocks if a template forgets to resolve)
+  const MAX_CUSTOM_WAIT_MS = 8000;
+  const MAX_ANIM_WAIT_MS   = 2000;
+
+  // Parameters polling
+  const PARAMS_POLL_MS = 500;
+  const __paramsText = Object.create(null); // url -> raw text snapshot
+  const __paramsData = Object.create(null); // url -> parsed object
+  let __paramsBusy = false;
+
+  function isSafeParamKey(k) {
+    return /^[A-Za-z0-9_\-]+$/.test(String(k));
+  }
+
+  async function fetchJsonText(url) {
+    const r = await fetch(url + "?t=" + Date.now(), { cache: "no-store" });
+    if (!r.ok) return null;
+    return await r.text();
+  }
+
+  async function pollParameters() {
+    if (__paramsBusy) return;
+    __paramsBusy = true;
+    try {
+      const urls = new Set([PARAMS_URL]);
+      for (const k in animMap) {
+        const cfg = animMap[k] || {};
+        if (cfg && cfg.paramsFile) urls.add(cfg.paramsFile);
+      }
+
+      const arr = Array.from(urls);
+      const results = await Promise.allSettled(arr.map(u => fetchJsonText(u)));
+      for (let i = 0; i < arr.length; i++) {
+        const url = arr[i];
+        const res = results[i];
+        if (res.status !== 'fulfilled' || res.value === null) continue;
+        const txt = res.value;
+        if (__paramsText[url] === txt) continue; // unchanged
+        try {
+          const json = JSON.parse(txt);
+          if (json && typeof json === 'object') {
+            __paramsText[url] = txt;
+            __paramsData[url] = json;
+          }
+        } catch (e) {
+          // Ignore parse errors (external writer may be mid-update)
+        }
+      }
+
+      // Apply to DOM (change-only updates)
+      const els = Array.from(document.querySelectorAll("#slt-root > li[id]"));
+      for (const el of els) {
+        const cfg = animMap[el.id] || {};
+        const url = (cfg && cfg.paramsFile) ? cfg.paramsFile : PARAMS_URL;
+        const data = __paramsData[url];
+        if (!data || typeof data !== 'object') continue;
+        const obj = (url === PARAMS_URL) ? (data[el.id] || null) : data;
+        if (!obj || typeof obj !== 'object') continue;
+
+        el.__slt_param_cache = (el.__slt_param_cache && typeof el.__slt_param_cache === 'object')
+          ? el.__slt_param_cache
+          : Object.create(null);
+
+        for (const key in obj) {
+          if (!Object.prototype.hasOwnProperty.call(obj, key)) continue;
+          if (!isSafeParamKey(key)) continue;
+          const val = obj[key];
+          const sval = (val === null || val === undefined) ? "" : String(val);
+          if (el.__slt_param_cache[key] === sval) continue;
+
+          const nodes = el.querySelectorAll(`[data-${key}]`);
+          if (!nodes || nodes.length === 0) {
+            el.__slt_param_cache[key] = sval;
+            continue;
+          }
+          nodes.forEach(n => { try { n.innerHTML = sval; } catch (e) {} });
+          el.__slt_param_cache[key] = sval;
+        }
+      }
+    } finally {
+      __paramsBusy = false;
+    }
+  }
+
+  function playCue(url) {
+    if (!url || !String(url).trim()) return;
+    try {
+      const a = new Audio(url);
+      a.volume = 1.0;
+      const p = a.play();
+      if (p && typeof p.catch === 'function') p.catch(() => {});
+    } catch (e) {}
+  }
+
+  function hasAnim(v) { return v && String(v).trim().length > 0; }
+
+  function getHook(el, name) {
+    const fn = el && el[name];
+    return (typeof fn === "function") ? fn : null;
+  }
+
+  // ---- Animation target resolution ----
+  // If the LT root <li> has lt-parent-styles, animate the first element child.
+  function getAnimTarget(rootEl) {
+    try {
+      if (rootEl && rootEl.classList && rootEl.classList.contains("lt-parent-styles")) {
+        const child = rootEl.firstElementChild;
+        return child || rootEl;
+      }
+    } catch (e) {}
+    return rootEl;
+  }
+
+  function getHookTarget(rootEl) {
+    return getAnimTarget(rootEl);
+  }
+
+  function stripAnimate(rootEl) {
+    const el = getAnimTarget(rootEl);
+    if (!el) return;
+
+    try { el.classList.remove("animate__animated"); } catch (e) {}
+    const added = Array.isArray(el.__slt_added) ? el.__slt_added : [];
+    for (const c of added) {
+      try { el.classList.remove(c); } catch (e) {}
+    }
+    el.__slt_added = [];
+    el.style.animationDelay = "";
+    el.style.animationDuration = "";
+    el.style.animationTimingFunction = "";
+  }
+
+  function addAnimClasses(rootEl, cls) {
+    const el = getAnimTarget(rootEl);
+    if (!el) return;
+
+    el.__slt_added = Array.isArray(el.__slt_added) ? el.__slt_added : [];
+    try {
+      el.classList.add("animate__animated");
+      el.__slt_added.push("animate__animated");
+    } catch (e) {}
+
+    String(cls).split(/\s+/).filter(Boolean).forEach(c => {
+      try { el.classList.add(c); } catch (e) {}
+      el.__slt_added.push(c);
+    });
+  }
+
+  function waitOwnAnimationEnd(rootEl, timeoutMs) {
+    const el = getAnimTarget(rootEl);
+    if (!el) return Promise.resolve();
+
+    return new Promise((resolve) => {
+      let done = false;
+
+      const cleanup = () => {
+        if (done) return;
+        done = true;
+        el.removeEventListener("animationend", onEnd, true);
+      };
+
+      const onEnd = (ev) => {
+        // Only end when the anim-target itself ends its animation (ignore child animations)
+        if (ev.target !== el) return;
+        cleanup();
+        resolve();
+      };
+
+      el.addEventListener("animationend", onEnd, true);
+      setTimeout(() => { cleanup(); resolve(); }, timeoutMs);
+    });
+  }
+
+  async function runHookWithTimeout(rootEl, name, timeoutMs) {
+    const el = getHookTarget(rootEl);
+    const fn = getHook(el, name);
+    if (!fn) return;
+
+    try {
+      const ret = fn.call(el);
+      if (ret && typeof ret.then === "function") {
+        await Promise.race([
+          ret,
+          new Promise(res => setTimeout(res, timeoutMs))
+        ]);
+      }
+    } catch (e) {
+      // Swallow template errors: base script must remain operational.
+    }
+  }
+
+  function setMounted(el, mounted) {
+    if (mounted) {
+      el.style.display = "block";
+      el.classList.add("slt-visible");
+      el.classList.remove("slt-hidden");
+    } else {
+      el.classList.remove("slt-visible");
+      el.classList.add("slt-hidden");
+      el.style.display = "none";
+    }
+  }
+
+  async function doShow(el, cfg) {
+    setMounted(el, true);
+    stripAnimate(el);
+
+    if (cfg && cfg.inSound) playCue(cfg.inSound);
+
+    if (cfg && cfg.inCustom) {
+      await runHookWithTimeout(el, "__slt_show", MAX_CUSTOM_WAIT_MS);
+      return;
+    }
+
+    if (cfg && hasAnim(cfg.inCls)) {
+      if (cfg.delay > 0) {
+        const t = getAnimTarget(el);
+        if (t) t.style.animationDelay = cfg.delay + "ms";
+      }
+      addAnimClasses(el, cfg.inCls);
+      await waitOwnAnimationEnd(el, MAX_ANIM_WAIT_MS);
+      stripAnimate(el);
+    }
+  }
+
+  async function doHide(el, cfg) {
+    stripAnimate(el);
+
+    if (cfg && cfg.outSound) playCue(cfg.outSound);
+
+    if (cfg && cfg.outCustom) {
+      await runHookWithTimeout(el, "__slt_hide", MAX_CUSTOM_WAIT_MS);
+      setMounted(el, false);
+      return;
+    }
+
+    if (cfg && hasAnim(cfg.outCls)) {
+      addAnimClasses(el, cfg.outCls);
+      await waitOwnAnimationEnd(el, MAX_ANIM_WAIT_MS);
+      stripAnimate(el);
+    }
+
+    setMounted(el, false);
+  }
+
+  function enqueue(el, job) {
+    el.__slt_queue = (el.__slt_queue || Promise.resolve())
+      .then(job)
+      .catch(() => {});
+  }
+
+  async function tick() {
+    let visibleIds;
+    try {
+      const r = await fetch(VISIBLE_URL + "?t=" + Date.now(), { cache: "no-store" });
+      visibleIds = await r.json();
+      if (!Array.isArray(visibleIds)) return;
+    } catch (e) {
+      return;
+    }
+
+    const visibleSet = new Set(visibleIds.map(String));
+    const els = Array.from(document.querySelectorAll("#slt-root > li[id]"));
+
+    for (const el of els) {
+      const cfg = animMap[el.id] || {};
+      const want = visibleSet.has(el.id);
+
+      el.dataset.want = want ? "1" : "0";
+
+      const isMounted = el.classList.contains("slt-visible") || el.style.display === "block";
+
+      if (want && isMounted) continue;
+      if (!want && !isMounted) continue;
+
+      if (el.dataset.busy === "1") continue;
+
+      el.dataset.busy = "1";
+      enqueue(el, async () => {
+        try {
+          const stillWant = el.dataset.want === "1";
+          if (stillWant) await doShow(el, cfg);
+          else await doHide(el, cfg);
+        } finally {
+          el.dataset.busy = "0";
+        }
+      });
+    }
+  }
+
+  document.addEventListener("DOMContentLoaded", () => {
+    tick();
+    setInterval(tick, 350);
+
+    pollParameters();
+    setInterval(pollParameters, PARAMS_POLL_MS);
+  });
+})();
+)JS");
+}
+
+static std::string build_item_script(const lower_third_cfg &c)
+{
+	std::string js = c.js_template;
+	const auto repl = build_placeholder_map(c);
+	js = replace_placeholders(std::move(js), repl);
+
+	std::string out;
+	out += "\n/* ---- " + c.id + " ---- */\n";
+	out += "(() => {\n";
+	out += "  const root = document.getElementById(\"" + c.id + "\");\n";
+	out += "  if (!root) return;\n";
+	out += "  try {\n";
+	out += js;
+	out += "\n  } catch(e) { console.error(\"SLT script error for " + c.id + "\", e); }\n";
+	out += "})();\n";
+	return out;
+}
+
+static std::string build_full_html(const std::string &ts, const std::string &cssFile, const std::string &jsFile)
+{
+	std::string html;
+	html += "<!doctype html>\n<html>\n<head>\n<meta charset=\"utf-8\"/>\n";
+	html += "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"/>\n";
+	html += "<link rel=\"stylesheet\" href=\"./" + cssFile + "?v=" + ts + "\"/>\n";
+
+	const std::string animateLocalAbs = path_animate_css();
+	if (!animateLocalAbs.empty() && file_exists(animateLocalAbs)) {
+		LOGI("Using local animate.min.css");
+		html += "<link rel=\"stylesheet\" href=\"./animate.min.css\"/>\n";
+	} else {
+		LOGI("Using CDN animate.css (local animate.min.css not found)");
+		html += "<link rel=\"stylesheet\" href=\"https://cdnjs.cloudflare.com/ajax/libs/animate.css/4.1.1/animate.min.css\"/>\n";
+	}
+
+	html += "</head>\n<body>\n<ul id=\"slt-root\">\n";
+
+	for (const auto &c : g_items) {
+		std::string inner = c.html_template;
+		const auto repl = build_placeholder_map(c);
+		inner = replace_placeholders(std::move(inner), repl);
+
+		if (inner.find("onerror") == std::string::npos) {
+			inner = replace_all(inner, "<img ", "<img onerror=\"this.style.display='none'\" ");
+		}
+
+		const bool customMode = (c.anim_in == "custom_handled_in") || (c.anim_out == "custom_handled_out");
+
+		html += "  <li id=\"" + c.id + "\" class=\"" + c.lt_position + "\"" +
+			(customMode ? " data-slt-mode=\"custom\"" : "") + ">";
+		html += inner;
+		html += "</li>\n";
+	}
+
+	html += "</ul>\n<script defer src=\"./" + jsFile + "?v=" + ts + "\"></script>\n</body>\n</html>\n";
+	return html;
+}
+
+bool has_output_dir()
+{
+	return !g_output_dir.empty();
+}
+
+std::string output_dir()
+{
+	return g_output_dir;
+}
+
+std::string path_state_json()
+{
+	return has_output_dir() ? join_path(g_output_dir, "lt-state.json") : "";
+}
+
+std::string path_visible_json()
+{
+	return has_output_dir() ? join_path(g_output_dir, "lt-visible.json") : "";
+}
+
+std::string path_styles_css()
+{
+	return has_output_dir() ? join_path(g_output_dir, "lt.css") : "";
+}
+
+std::string path_scripts_js()
+{
+	return has_output_dir() ? join_path(g_output_dir, "lt.js") : "";
+}
+
+std::string path_parameters_json()
+{
+	return has_output_dir() ? join_path(g_output_dir, "parameters.json") : "";
+}
+
+std::string path_parameters_lt_json(const std::string &id)
+{
+	if (!has_output_dir())
+		return {};
+	return join_path(g_output_dir, "parameters_" + id + ".json");
+}
+
+bool set_template_parameters(const std::string &id, const QJsonObject &data)
+{
+	if (!has_output_dir())
+		return false;
+
+	const std::string sid = sanitize_id(id);
+	if (sid.empty() || !get_by_id(sid))
+		return false;
+
+	const std::string perPath = path_parameters_lt_json(sid);
+	if (!write_text_file_atomic(perPath, QJsonDocument(data).toJson(QJsonDocument::Indented).toStdString()))
+		return false;
+
+	const std::string combinedPath = path_parameters_json();
+	if (!combinedPath.empty()) {
+		const QString qCombinedPath = QString::fromStdString(combinedPath);
+		if (QFile::exists(qCombinedPath)) {
+			QJsonObject combinedRoot;
+			const std::string txt = read_text_file(combinedPath);
+			if (parse_json_object_text(txt, combinedRoot)) {
+				combinedRoot[QString::fromStdString(sid)] = data;
+				write_text_file_atomic(
+					combinedPath,
+					QJsonDocument(combinedRoot).toJson(QJsonDocument::Indented).toStdString());
+			}
+		}
+	}
+
+	return true;
+}
+
+bool get_template_parameters(const std::string &id, QJsonObject &out)
+{
+	out = QJsonObject();
+	if (!has_output_dir())
+		return false;
+
+	const std::string sid = sanitize_id(id);
+	if (sid.empty() || !get_by_id(sid))
+		return false;
+
+	const std::string perPath = path_parameters_lt_json(sid);
+	const QString qPerPath = QString::fromStdString(perPath);
+	if (QFile::exists(qPerPath)) {
+		const std::string txt = read_text_file(perPath);
+		if (!parse_json_object_text(txt, out))
+			return false;
+		return true;
+	}
+
+	const std::string combinedPath = path_parameters_json();
+	if (!combinedPath.empty()) {
+		const QString qCombinedPath = QString::fromStdString(combinedPath);
+		if (QFile::exists(qCombinedPath)) {
+			QJsonObject combinedRoot;
+			const std::string txt = read_text_file(combinedPath);
+			if (!parse_json_object_text(txt, combinedRoot))
+				return false;
+			const QJsonValue entry = combinedRoot.value(QString::fromStdString(sid));
+			if (entry.isObject())
+				out = entry.toObject();
+			return true;
+		}
+	}
+
+	return true;
+}
+
+std::string path_animate_css()
+{
+	return has_output_dir() ? join_path(g_output_dir, "animate.min.css") : "";
+}
+
+std::string now_timestamp_string()
+{
+	const qint64 ts = QDateTime::currentMSecsSinceEpoch();
+	return std::to_string((long long)ts);
+}
+
+std::string new_id()
+{
+	static std::mt19937_64 rng{std::random_device{}()};
+	static std::uniform_int_distribution<uint64_t> dist;
+	uint64_t a = dist(rng);
+	uint64_t b = dist(rng);
+
+	std::ostringstream ss;
+	ss << "lt_" << std::hex << a << b;
+	return sanitize_id(ss.str());
+}
+
+std::vector<lower_third_cfg> &all()
+{
+	return g_items;
+}
+
+const std::vector<lower_third_cfg> &all_const()
+{
+	return g_items;
+}
+
+lower_third_cfg *get_by_id(const std::string &id)
+{
+	for (auto &c : g_items)
+		if (c.id == id)
+			return &c;
+	return nullptr;
+}
+
+std::vector<group_cfg> &groups()
+{
+	return g_groups;
+}
+
+const std::vector<group_cfg> &groups_const()
+{
+	return g_groups;
+}
+
+group_cfg *get_group_by_id(const std::string &id)
+{
+	const std::string sid = sanitize_id(id);
+	for (auto &c : g_groups) {
+		if (c.id == sid)
+			return &c;
+	}
+	return nullptr;
+}
+
+std::vector<std::string> groups_containing(const std::string &lower_third_id)
+{
+	std::vector<std::string> out;
+	const std::string sid = sanitize_id(lower_third_id);
+	for (const auto &c : g_groups) {
+		for (const auto &mid : c.members) {
+			if (mid == sid) {
+				out.push_back(c.id);
+				break;
+			}
+		}
+	}
+	return out;
+}
+
+std::vector<std::string> visible_ids()
+{
+	return g_visible;
+}
+
+bool is_visible(const std::string &id)
+{
+	return std::find(g_visible.begin(), g_visible.end(), id) != g_visible.end();
+}
+
+void set_visible_nosave(const std::string &id, bool visible)
+{
+	if (id.empty())
+		return;
+
+	if (visible) {
+		if (!is_visible(id))
+			g_visible.push_back(id);
+	} else {
+		g_visible.erase(std::remove(g_visible.begin(), g_visible.end(), id), g_visible.end());
+	}
+}
+
+void toggle_visible_nosave(const std::string &id)
+{
+	set_visible_nosave(id, !is_visible(id));
+}
+
+bool set_visible_persist(const std::string &id, bool visible)
+{
+	if (!has_output_dir() || id.empty())
+		return false;
+
+	if (!get_by_id(id))
+		return false;
+
+	const bool before = is_visible(id);
+	if (before == visible) {
+		return true;
+	}
+
+	std::vector<std::string> hidden;
+
+	if (visible && !before) {
+		const auto owners = groups_containing(id);
+		if (!owners.empty()) {
+			group_cfg *g = get_group_by_id(owners.front());
+			if (g && g->exclusive) {
+				std::unordered_set<std::string> memberSet;
+				memberSet.reserve(g->members.size() * 2 + 1);
+				for (const auto &m : g->members)
+					memberSet.insert(m);
+
+				for (const auto &vid : g_visible) {
+					if (vid == id)
+						continue;
+					if (memberSet.find(vid) != memberSet.end())
+						hidden.push_back(vid);
+				}
+			}
+		}
+	}
+
+	for (const auto &hid : hidden)
+		set_visible_nosave(hid, false);
+
+	set_visible_nosave(id, visible);
+	if (!save_visible_json())
+		return false;
+
+	const auto visNow = visible_ids();
+	for (const auto &hid : hidden) {
+		core_event ev;
+		ev.type = event_type::VisibilityChanged;
+		ev.id = hid;
+		ev.visible = false;
+		ev.visible_ids = visNow;
+		emit_event(ev);
+	}
+
+	core_event ev;
+	ev.type = event_type::VisibilityChanged;
+	ev.id = id;
+	ev.visible = visible;
+	ev.visible_ids = visNow;
+	emit_event(ev);
+
+	return true;
+}
+
+bool toggle_visible_persist(const std::string &id)
+{
+	if (!has_output_dir() || id.empty())
+		return false;
+
+	if (!get_by_id(id))
+		return false;
+
+	const bool after = !is_visible(id);
+	return set_visible_persist(id, after);
+}
+
+bool ensure_output_artifacts_exist()
+{
+	if (!has_output_dir())
+		return false;
+
+	ensure_dir(output_dir());
+
+	if (!QFile::exists(QString::fromStdString(path_state_json()))) {
+		g_items.clear();
+		save_state_json();
+	}
+	if (!QFile::exists(QString::fromStdString(path_visible_json()))) {
+		g_visible.clear();
+		save_visible_json();
+	}
+	if (!QFile::exists(QString::fromStdString(path_styles_css()))) {
+		write_text_file(path_styles_css(), "/* generated */\n");
+	}
+	if (!QFile::exists(QString::fromStdString(path_scripts_js()))) {
+		write_text_file(path_scripts_js(), "/* generated */\n");
+	}
+
+	return true;
+}
+
+static bool ensure_parameters_files_from_api_templates()
+{
+	if (!has_output_dir())
+		return false;
+
+	const std::string combinedPath = path_parameters_json();
+	const bool combinedExists = QFile::exists(QString::fromStdString(combinedPath));
+	QJsonObject combinedRoot;
+	bool combinedOk = true;
+	if (combinedExists) {
+		const std::string txt = read_text_file(combinedPath);
+		combinedOk = parse_json_object_text(txt, combinedRoot);
+	}
+	bool combinedDirty = false;
+
+	const bool allowCombinedWrite = !combinedExists || combinedOk;
+
+	for (const auto &lt : g_items) {
+		const std::string perPath = path_parameters_lt_json(lt.id);
+
+		if (!lt.api_bridge_enabled) {
+			// Bridge disabled: remove stale file if present.
+			const QString qp = QString::fromStdString(perPath);
+			if (QFile::exists(qp))
+				QFile::remove(qp);
+			continue;
+		}
+
+		// Bridge enabled: create/update the per-LT file.
+		QJsonObject seedObj;
+		bool seedOk = false;
+
+		// Backward compatibility: if a legacy API template exists, use it as a seed schema.
+		const std::string api = QString::fromStdString(lt.api_template).trimmed().toStdString();
+		if (!api.empty())
+			seedOk = parse_json_object_text(api, seedObj);
+
+		const bool perExists = QFile::exists(QString::fromStdString(perPath));
+		QJsonObject perObj;
+		bool perOk = true;
+		if (perExists) {
+			const std::string txt = read_text_file(perPath);
+			perOk = parse_json_object_text(txt, perObj);
+		}
+
+		if (perExists && !perOk)
+			continue;
+
+		bool perDirty = false;
+
+		if (seedOk) {
+			for (auto it = seedObj.begin(); it != seedObj.end(); ++it) {
+				if (!perObj.contains(it.key())) {
+					perObj.insert(it.key(), it.value());
+					perDirty = true;
+				}
+			}
+		}
+
+		// If file does not exist, create at least an empty object.
+		if (!perExists) {
+			perDirty = true;
+		}
+
+		if (perDirty) {
+			write_text_file_atomic(perPath, QJsonDocument(perObj).toJson(QJsonDocument::Indented).toStdString());
+		}
+
+		// Optional combined parameters.json (kept only for tooling convenience).
+		if (allowCombinedWrite) {
+			QJsonObject bucket = combinedRoot.value(QString::fromStdString(lt.id)).toObject();
+			bool bucketDirty = false;
+
+			if (seedOk) {
+				for (auto it = seedObj.begin(); it != seedObj.end(); ++it) {
+					if (!bucket.contains(it.key())) {
+						bucket.insert(it.key(), it.value());
+						bucketDirty = true;
+					}
+				}
+			}
+
+			if (bucketDirty || !combinedRoot.contains(QString::fromStdString(lt.id))) {
+				combinedRoot.insert(QString::fromStdString(lt.id), bucket);
+				combinedDirty = true;
+			}
+		}
+	}
+
+	if (allowCombinedWrite && (combinedDirty || !combinedExists)) {
+		write_text_file_atomic(combinedPath, QJsonDocument(combinedRoot).toJson(QJsonDocument::Indented).toStdString());
+	}
+
+	return true;
+}
+
+
+bool load_state_json()
+{
+	if (!has_output_dir())
+		return false;
+
+	const std::string p = path_state_json();
+	if (!QFile::exists(QString::fromStdString(p))) {
+		g_items.clear();
+		g_groups.clear();
+		return true;
+	}
+
+	const std::string txt = read_text_file(p);
+	if (txt.empty()) {
+		g_items.clear();
+		g_groups.clear();
+		return true;
+	}
+
+	QJsonParseError err{};
+	const QJsonDocument doc = QJsonDocument::fromJson(QByteArray::fromStdString(txt), &err);
+	if (err.error != QJsonParseError::NoError || !doc.isObject()) {
+		LOGW("Invalid lt-state.json; reset");
+		g_items.clear();
+		g_groups.clear();
+		return false;
+	}
+
+	const QJsonObject root = doc.object();
+	const QJsonObject hkRoot = root.value("hotkeys").toObject();
+	const QJsonObject hkItems = hkRoot.value("items").toObject();
+	const QJsonObject hkGroups = hkRoot.value("groups").toObject();
+
+	const QJsonArray items = root.value("items").toArray();
+	const QJsonArray cars = root.contains("groups") ? root.value("groups").toArray() : root.value("carousels").toArray();
+
+	std::vector<lower_third_cfg> out;
+	out.reserve((size_t)items.size());
+
+	for (const QJsonValue v : items) {
+		if (!v.isObject())
+			continue;
+		const QJsonObject o = v.toObject();
+
+		lower_third_cfg c;
+		c.id = sanitize_id(o.value("id").toString().toStdString());
+		if (c.id.empty())
+			c.id = new_id();
+
+		c.label = o.value("label").toString().toStdString();
+		c.order = o.value("order").toInt(-1);
+
+		c.title = o.value("title").toString().toStdString();
+		c.subtitle = o.value("subtitle").toString().toStdString();
+		c.profile_picture = o.value("profile_picture").toString().toStdString();
+		c.anim_in_sound = o.value("anim_in_sound").toString().toStdString();
+		c.anim_out_sound = o.value("anim_out_sound").toString().toStdString();
+
+		c.title_size = o.value("title_size").toInt(46);
+		c.subtitle_size = o.value("subtitle_size").toInt(24);
+		c.title_size = std::max(6, std::min(200, c.title_size));
+		c.subtitle_size = std::max(6, std::min(200, c.subtitle_size));
+
+		c.avatar_width = o.value("avatar_width").toInt(100);
+		c.avatar_height = o.value("avatar_height").toInt(100);
+		c.avatar_width = std::max(10, std::min(400, c.avatar_width));
+		c.avatar_height = std::max(10, std::min(400, c.avatar_height));
+
+		c.anim_in = o.value("anim_in").toString().toStdString();
+		c.anim_out = o.value("anim_out").toString().toStdString();
+
+		c.font_family = o.value("font_family").toString().toStdString();
+		c.lt_position = o.value("lt_position").toString().toStdString();
+
+		c.primary_color = o.value("primary_color").toString().toStdString();
+		c.secondary_color = o.value("secondary_color").toString().toStdString();
+		c.title_color = o.value("title_color").toString().toStdString();
+		c.subtitle_color = o.value("subtitle_color").toString().toStdString();
+
+		if (c.primary_color.empty())
+			c.primary_color = o.value("bg_color").toString().toStdString();
+		if (c.title_color.empty())
+			c.title_color = o.value("text_color").toString().toStdString();
+		if (c.secondary_color.empty())
+			c.secondary_color = c.primary_color;
+		if (c.subtitle_color.empty())
+			c.subtitle_color = c.title_color;
+		c.opacity = o.value("opacity").toInt(0);
+		c.radius = o.value("radius").toInt(0);
+
+		if (c.opacity < 0 || c.opacity > 100)
+			c.opacity = 85;
+		if (c.radius < 0 || c.radius > 100)
+			c.radius = 5;
+
+		c.html_template = o.value("html_template").toString().toStdString();
+		c.css_template = o.value("css_template").toString().toStdString();
+		c.js_template = o.value("js_template").toString().toStdString();
+		c.api_template = o.value("api_template").toString().toStdString();
+		c.api_bridge_enabled = o.value("api_bridge_enabled").toBool(o.value("api_bridge").toBool(false));
+		// Backward compatibility: if a legacy api_template exists and no explicit flag was set, assume enabled.
+		if (!o.contains("api_bridge_enabled") && !o.contains("api_bridge")) {
+			if (!QString::fromStdString(c.api_template).trimmed().isEmpty())
+				c.api_bridge_enabled = true;
+		}
+
+
+		c.hotkey = o.value("hotkey").toString().toStdString();
+		if (c.hotkey.empty()) {
+			const QString k = hkItems.value(QString::fromStdString(c.id)).toString().trimmed();
+			if (!k.isEmpty())
+				c.hotkey = k.toStdString();
+		}
+		if (c.hotkey.empty()) {
+			const QString fallback = hkItems.value(QString::fromStdString(c.id)).toString();
+			if (!fallback.isEmpty())
+				c.hotkey = fallback.toStdString();
+		}
+		c.repeat_every_sec = o.value("repeat_every_sec").toInt(0);
+		c.repeat_visible_sec = o.value("repeat_visible_sec").toInt(0);
+
+		if (c.repeat_every_sec < 0)
+			c.repeat_every_sec = 0;
+		if (c.repeat_visible_sec < 0)
+			c.repeat_visible_sec = 0;
+
+		if (c.html_template.empty() || c.css_template.empty()) {
+			auto d = default_cfg();
+			if (c.html_template.empty())
+				c.html_template = d.html_template;
+			if (c.css_template.empty())
+				c.css_template = d.css_template;
+			if (c.js_template.empty())
+				c.js_template = d.js_template;
+		}
+
+		if (c.lt_position.empty())
+			c.lt_position = "lt-pos-bottom-left";
+		if (c.anim_in.empty())
+			c.anim_in = "animate__fadeInUp";
+		if (c.anim_out.empty())
+			c.anim_out = "animate__fadeOutDown";
+		if (c.primary_color.empty())
+			c.primary_color = "#111827";
+		if (c.secondary_color.empty())
+			c.secondary_color = "#1F2937";
+		if (c.title_color.empty())
+			c.title_color = "#F9FAFB";
+		if (c.subtitle_color.empty())
+			c.subtitle_color = "#D1D5DB";
+
+		if (c.label.empty())
+			c.label = c.title.empty() ? c.id : c.title;
+
+		out.push_back(std::move(c));
+	}
+
+	int nextOrder = 0;
+	for (auto &c : out) {
+		if (c.order < 0)
+			c.order = nextOrder;
+		nextOrder = std::max(nextOrder, c.order + 1);
+	}
+	std::sort(out.begin(), out.end(), [](const lower_third_cfg &a, const lower_third_cfg &b) {
+		if (a.order != b.order)
+			return a.order < b.order;
+		return a.id < b.id;
+	});
+
+	std::vector<group_cfg> outCars;
+	outCars.reserve((size_t)cars.size());
+	for (const QJsonValue v : cars) {
+		if (!v.isObject())
+			continue;
+		const QJsonObject o = v.toObject();
+
+		group_cfg c;
+		c.id = sanitize_id(o.value("id").toString().toStdString());
+		if (c.id.empty())
+			c.id = new_id();
+
+		c.title = o.value("title").toString().toStdString();
+		c.order = o.value("order").toInt(-1);
+		c.order_mode = o.value("order_mode").toInt(0);
+		c.loop = o.value("loop").toBool(true);
+		c.exclusive = o.value("exclusive").toBool(false);
+		c.toggle_hotkey = o.value("toggle_hotkey").toString().toStdString();
+		if (c.toggle_hotkey.empty()) {
+			const QString start = o.value("start_hotkey").toString().trimmed();
+			const QString stop = o.value("stop_hotkey").toString().trimmed();
+			if (!start.isEmpty())
+				c.toggle_hotkey = start.toStdString();
+			else if (!stop.isEmpty())
+				c.toggle_hotkey = stop.toStdString();
+		}
+		if (c.toggle_hotkey.empty()) {
+			const QString fallback = hkGroups.value(QString::fromStdString(c.id)).toString();
+			if (!fallback.isEmpty())
+				c.toggle_hotkey = fallback.toStdString();
+		}
+
+		c.visible_ms = o.value("visible_ms").toInt(15000);
+		c.interval_ms = o.value("interval_ms").toInt(5000);
+		c.dock_color = o.value("dock_color").toString().toStdString();
+
+		if (c.visible_ms < 250)
+			c.visible_ms = 250;
+		if (c.interval_ms < 0)
+			c.interval_ms = 0;
+		if (c.order_mode != 1)
+			c.order_mode = 0;
+		if (c.order_mode < 0 || c.order_mode > 1)
+			c.order_mode = 0;
+
+		const QJsonArray mem = o.value("members").toArray();
+		for (const QJsonValue mv : mem) {
+			const std::string mid = sanitize_id(mv.toString().toStdString());
+			if (!mid.empty())
+				c.members.push_back(mid);
+		}
+
+		if (c.title.empty())
+			c.title = "Group";
+
+		outCars.push_back(std::move(c));
+	}
+
+	int nextCarOrder = 0;
+	for (auto &c : outCars) {
+		if (c.order < 0)
+			c.order = nextCarOrder;
+		nextCarOrder = std::max(nextCarOrder, c.order + 1);
+	}
+	std::sort(outCars.begin(), outCars.end(), [](const group_cfg &a, const group_cfg &b) {
+		if (a.order != b.order)
+			return a.order < b.order;
+		return a.id < b.id;
+	});
+
+	g_groups = std::move(outCars);
+
+	{
+		std::unordered_set<std::string> claimed;
+		for (auto &car : g_groups) {
+			std::vector<std::string> uniq;
+			uniq.reserve(car.members.size());
+			for (const auto &midRaw : car.members) {
+				const std::string mid = sanitize_id(midRaw);
+				if (mid.empty())
+					continue;
+				if (claimed.find(mid) != claimed.end())
+					continue;
+				claimed.insert(mid);
+				uniq.push_back(mid);
+			}
+			car.members = std::move(uniq);
+		}
+	}
+
+	g_items = std::move(out);
+
+	for (const auto &car : g_groups) {
+		for (const auto &mid : car.members) {
+			if (auto *lt = get_by_id(mid)) {
+				lt->repeat_every_sec = 0;
+				lt->repeat_visible_sec = 0;
+			}
+		}
+	}
+	return true;
+}
+
+bool save_state_json()
+{
+	if (!has_output_dir())
+		return false;
+
+	QJsonObject root;
+	root["version"] = 4;
+
+	QJsonArray items;
+	for (const auto &c : g_items) {
+		QJsonObject o;
+		o["id"] = QString::fromStdString(c.id);
+		o["label"] = QString::fromStdString(c.label);
+		o["order"] = c.order;
+		o["title"] = QString::fromStdString(c.title);
+		o["subtitle"] = QString::fromStdString(c.subtitle);
+		o["profile_picture"] = QString::fromStdString(c.profile_picture);
+		o["anim_in_sound"] = QString::fromStdString(c.anim_in_sound);
+		o["anim_out_sound"] = QString::fromStdString(c.anim_out_sound);
+
+		o["title_size"] = c.title_size;
+		o["subtitle_size"] = c.subtitle_size;
+		o["avatar_width"] = c.avatar_width;
+		o["avatar_height"] = c.avatar_height;
+
+		o["anim_in"] = QString::fromStdString(c.anim_in);
+		o["anim_out"] = QString::fromStdString(c.anim_out);
+
+		o["font_family"] = QString::fromStdString(c.font_family);
+		o["lt_position"] = QString::fromStdString(c.lt_position);
+
+		o["primary_color"] = QString::fromStdString(c.primary_color);
+		o["secondary_color"] = QString::fromStdString(c.secondary_color);
+		o["title_color"] = QString::fromStdString(c.title_color);
+		o["subtitle_color"] = QString::fromStdString(c.subtitle_color);
+
+		o["bg_color"] = QString::fromStdString(c.primary_color);
+		o["text_color"] = QString::fromStdString(c.title_color);
+		o["opacity"] = c.opacity;
+		o["radius"] = c.radius;
+
+		o["html_template"] = QString::fromStdString(c.html_template);
+		o["css_template"] = QString::fromStdString(c.css_template);
+		o["js_template"] = QString::fromStdString(c.js_template);
+		o["api_bridge_enabled"] = c.api_bridge_enabled;
+		o["api_template"] = QString::fromStdString(c.api_template);
+
+		o["hotkey"] = QString::fromStdString(c.hotkey);
+		o["repeat_every_sec"] = c.repeat_every_sec;
+		o["repeat_visible_sec"] = c.repeat_visible_sec;
+
+		items.append(o);
+	}
+
+	QJsonArray cars;
+	for (const auto &c : g_groups) {
+		QJsonObject o;
+		o["id"] = QString::fromStdString(c.id);
+		o["title"] = QString::fromStdString(c.title);
+		o["order"] = c.order;
+		o["order_mode"] = c.order_mode;
+		o["loop"] = c.loop;
+		o["exclusive"] = c.exclusive;
+		o["toggle_hotkey"] = QString::fromStdString(c.toggle_hotkey);
+		o["visible_ms"] = c.visible_ms;
+		o["interval_ms"] = c.interval_ms;
+		o["dock_color"] = QString::fromStdString(c.dock_color);
+
+		QJsonArray mem;
+		for (const auto &mid : c.members)
+			mem.append(QString::fromStdString(mid));
+		o["members"] = mem;
+
+		cars.append(o);
+	}
+	root["groups"] = cars;
+
+	root["items"] = items;
+
+	QJsonObject hkRoot;
+	QJsonObject hkItems;
+	for (const auto &c : g_items) {
+		if (!c.hotkey.empty())
+			hkItems[QString::fromStdString(c.id)] = QString::fromStdString(c.hotkey);
+	}
+	QJsonObject hkGroups;
+	for (const auto &g : g_groups) {
+		if (!g.toggle_hotkey.empty())
+			hkGroups[QString::fromStdString(g.id)] = QString::fromStdString(g.toggle_hotkey);
+	}
+	hkRoot["items"] = hkItems;
+	hkRoot["groups"] = hkGroups;
+	root["hotkeys"] = hkRoot;
+
+	const QJsonDocument doc(root);
+	return write_text_file(path_state_json(), doc.toJson(QJsonDocument::Indented).toStdString());
+}
+
+bool load_visible_json()
+{
+	if (!has_output_dir())
+		return false;
+
+	const std::string p = path_visible_json();
+	if (!QFile::exists(QString::fromStdString(p))) {
+		g_visible.clear();
+		return true;
+	}
+
+	const std::string txt = read_text_file(p);
+	if (txt.empty()) {
+		g_visible.clear();
+		return true;
+	}
+
+	QJsonParseError err{};
+	const QJsonDocument doc = QJsonDocument::fromJson(QByteArray::fromStdString(txt), &err);
+	if (err.error != QJsonParseError::NoError) {
+		LOGW("Invalid lt-visible.json; reset");
+		g_visible.clear();
+		return false;
+	}
+
+	std::vector<std::string> ids;
+	if (doc.isArray()) {
+		const QJsonArray a = doc.array();
+		for (const QJsonValue v : a) {
+			if (v.isString())
+				ids.push_back(sanitize_id(v.toString().toStdString()));
+		}
+	}
+
+	std::vector<std::string> keep;
+	keep.reserve(ids.size());
+	for (const auto &id : ids)
+		if (get_by_id(id))
+			keep.push_back(id);
+
+	g_visible = std::move(keep);
+	return true;
+}
+
+bool save_visible_json()
+{
+	if (!has_output_dir())
+		return false;
+
+	std::vector<std::string> ids = g_visible;
+	ids.erase(std::remove_if(ids.begin(), ids.end(), [](const std::string &s) { return s.empty(); }), ids.end());
+	std::sort(ids.begin(), ids.end());
+	ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+
+	QJsonArray a;
+	for (const auto &id : ids)
+		a.append(QString::fromStdString(id));
+
+	const QJsonDocument doc(a);
+	return write_text_file(path_visible_json(), doc.toJson(QJsonDocument::Indented).toStdString());
+}
+
+static bool regenerate_merged_css_js(const std::string &ts, std::string &outCssFile, std::string &outJsFile)
+{
+	if (!has_output_dir())
+		return false;
+
+	outCssFile = bundle_styles_name(ts);
+	outJsFile = bundle_scripts_name(ts);
+
+	std::string css;
+	css += build_shared_css();
+
+	css += R"CSS(
+
+/* Position classes */
+.lt-pos-bottom-left  {
+  left: var(--slt-safe-margin);
+  bottom: var(--slt-safe-margin);
+}
+
+.lt-pos-bottom-right {
+  right: var(--slt-safe-margin);
+  bottom: var(--slt-safe-margin);
+}
+
+.lt-pos-top-left {
+  left: var(--slt-safe-margin);
+  top: var(--slt-safe-margin);
+}
+
+.lt-pos-top-right {
+  right: var(--slt-safe-margin);
+  top: var(--slt-safe-margin);
+}
+
+.lt-pos-center {
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+}
+
+.lt-pos-top-center {
+  left: 50%;
+  top: var(--slt-safe-margin);
+  transform: translateX(-50%);
+}
+
+.lt-pos-bottom-center {
+  left: 50%;
+  bottom: var(--slt-safe-margin);
+  transform: translateX(-50%);
+}
+
+)CSS";
+
+	css += "\n/* Per-LT scoped styles */\n";
+
+	std::unordered_map<std::string, std::string> kfNameToNorm;
+	std::unordered_map<std::string, std::string> kfNameToBlock;
+	std::vector<std::string> kfOrder;
+
+	for (const auto &c : g_items) {
+
+		std::string per = c.css_template;
+
+		const auto repl = build_placeholder_map(c);
+		per = replace_placeholders(std::move(per), repl);
+
+		std::vector<extracted_keyframes> extracted;
+		extract_keyframes_blocks(per, extracted);
+
+		for (auto &kf : extracted) {
+
+			if (kf.name.empty()) {
+				const std::string sig = kf.norm;
+				bool exists = false;
+				for (const auto &kv : kfNameToNorm) {
+					if (kv.second == sig) {
+						exists = true;
+						break;
+					}
+				}
+				if (!exists) {
+					const std::string anonName =
+						"kf_" + c.id + "_" + std::to_string(kfOrder.size());
+					kfNameToNorm[anonName] = sig;
+					kfNameToBlock[anonName] = kf.block;
+					kfOrder.push_back(anonName);
+				}
+				continue;
+			}
+
+			auto it = kfNameToNorm.find(kf.name);
+			if (it == kfNameToNorm.end()) {
+
+				kfNameToNorm[kf.name] = kf.norm;
+				kfNameToBlock[kf.name] = kf.block;
+				kfOrder.push_back(kf.name);
+				continue;
+			}
+
+			if (it->second == kf.norm) {
+
+				continue;
+			}
+
+			const std::string oldName = kf.name;
+			const std::string newName = oldName + "_" + c.id;
+
+			const std::string fromHdr = kf.at_rule + std::string(" ") + oldName;
+			const std::string toHdr = kf.at_rule + std::string(" ") + newName;
+			kf.block = replace_all(kf.block, fromHdr, toHdr);
+			kf.name = newName;
+			kf.norm = normalize_ws_no_space(kf.block);
+
+			per = replace_whole_ident(per, oldName, newName);
+
+			kfNameToNorm[kf.name] = kf.norm;
+			kfNameToBlock[kf.name] = kf.block;
+			kfOrder.push_back(kf.name);
+		}
+
+		lower_third_cfg tmp = c;
+		tmp.css_template = per;
+		css += "\n" + scope_css_best_effort(tmp);
+	}
+
+	css += "\n/* Keyframes (deduped) */\n";
+	{
+		std::unordered_set<std::string> emitted;
+		for (const auto &name : kfOrder) {
+			if (!emitted.insert(name).second)
+				continue;
+			auto it = kfNameToBlock.find(name);
+			if (it != kfNameToBlock.end()) {
+				css += "\n" + it->second + "\n";
+			}
+		}
+	}
+
+	const std::string cssPath = bundle_styles_path(ts);
+	if (cssPath.empty() || !write_text_file(cssPath, css)) {
+		LOGW("Failed writing %s", cssPath.empty() ? "<empty css path>" : cssPath.c_str());
+		return false;
+	}
+
+	std::string js;
+	js += build_base_script(g_items);
+	js += "\n\n/* Per-LT scripts */\n";
+	for (const auto &c : g_items)
+		js += build_item_script(c);
+
+	const std::string jsPath = bundle_scripts_path(ts);
+	if (jsPath.empty() || !write_text_file(jsPath, js)) {
+		LOGW("Failed writing %s", jsPath.empty() ? "<empty js path>" : jsPath.c_str());
+		return false;
+	}
+
+	return true;
+}
+
+static std::string generate_bundle_html(const std::string &ts, const std::string &cssFile, const std::string &jsFile)
+{
+	if (!has_output_dir())
+		return {};
+
+	const std::string absCur = bundle_html_current_path();
+	if (absCur.empty())
+		return {};
+
+	const std::string html = build_full_html(ts, cssFile, jsFile);
+
+	if (!write_text_file(absCur, html))
+		return {};
+
+	return absCur;
+}
+
+static obs_source_t *get_target_browser_source()
+{
+	const std::string name = target_browser_source_name();
+	if (name.empty())
+		return nullptr;
+
+	return obs_get_source_by_name(name.c_str());
+}
+
+std::vector<std::string> list_browser_source_names()
+{
+	std::vector<std::string> out;
+
+	auto enum_cb = [](void *param, obs_source_t *src) -> bool {
+		if (!src)
+			return true;
+
+		const char *id = obs_source_get_id(src);
+		if (!id)
+			return true;
+
+		if (std::string(id) != sltBrowserSourceId)
+			return true;
+
+		const char *name = obs_source_get_name(src);
+		if (name && *name) {
+			auto *vec = static_cast<std::vector<std::string> *>(param);
+			vec->push_back(std::string(name));
+		}
+		return true;
+	};
+
+	obs_enum_sources(enum_cb, &out);
+
+	std::sort(out.begin(), out.end());
+	out.erase(std::unique(out.begin(), out.end()), out.end());
+	return out;
+}
+
+std::string target_browser_source_name()
+{
+	const std::string col = current_scene_collection_name();
+	if (!col.empty()) {
+		auto it = g_target_browser_source_by_collection.find(col);
+		if (it != g_target_browser_source_by_collection.end())
+			return it->second;
+	}
+
+	return g_target_browser_source;
+}
+
+bool set_target_browser_source_name(const std::string &name)
+{
+	g_target_browser_source = name;
+
+	const std::string col = current_scene_collection_name();
+	if (!col.empty()) {
+		if (name.empty())
+			g_target_browser_source_by_collection.erase(col);
+		else
+			g_target_browser_source_by_collection[col] = name;
+	}
+	return save_global_config();
+}
+
+int target_browser_width()
+{
+	return g_target_browser_width;
+}
+
+int target_browser_height()
+{
+	return g_target_browser_height;
+}
+
+bool set_target_browser_dimensions(int width, int height)
+{
+	if (width < 1)
+		width = 1;
+	if (height < 1)
+		height = 1;
+
+	g_target_browser_width = width;
+	g_target_browser_height = height;
+
+	obs_source_t *src = get_target_browser_source();
+	if (src) {
+		obs_data_t *s = obs_source_get_settings(src);
+		obs_data_set_int(s, "width", (int64_t)g_target_browser_width);
+		obs_data_set_int(s, "height", (int64_t)g_target_browser_height);
+		obs_source_update(src, s);
+		obs_data_release(s);
+		obs_source_release(src);
+	}
+
+	return save_global_config();
+}
+
+bool target_browser_source_exists()
+{
+	obs_source_t *src = get_target_browser_source();
+	if (!src)
+		return false;
+
+	const char *id = obs_source_get_id(src);
+	const bool ok = (id && std::string(id) == sltBrowserSourceId);
+
+	obs_source_release(src);
+	return ok;
+}
+
+static void refreshSourceSettings(obs_source_t *s)
+{
+	if (!s)
+		return;
+
+	obs_data_t *data = obs_source_get_settings(s);
+	obs_source_update(s, data);
+	obs_data_release(data);
+
+	if (strcmp(obs_source_get_id(s), "browser_source") == 0) {
+		obs_properties_t *sourceProperties = obs_source_properties(s);
+		obs_property_t *property = obs_properties_get(sourceProperties, "refreshnocache");
+		if (property)
+			obs_property_button_clicked(property, s);
+		obs_properties_destroy(sourceProperties);
+	}
+}
+
+bool swap_target_browser_source_to_file(const std::string &absoluteHtmlPath)
+{
+	if (absoluteHtmlPath.empty())
+		return false;
+
+	obs_source_t *src = get_target_browser_source();
+	if (!src) {
+		if (g_target_browser_source.empty())
+			LOGW("No target Browser Source selected.");
+		else
+			LOGW("Target Browser Source '%s' not found.", g_target_browser_source.c_str());
+		return false;
+	}
+
+	const char *id = obs_source_get_id(src);
+	if (!id || std::string(id) != sltBrowserSourceId) {
+		LOGW("Target source '%s' is not a Browser Source.", g_target_browser_source.c_str());
+		obs_source_release(src);
+		return false;
+	}
+
+	obs_data_t *s = obs_source_get_settings(src);
+	const char *prevPathC = obs_data_get_string(s, "local_file");
+	const std::string prevPath = prevPathC ? std::string(prevPathC) : std::string();
+
+	if (!prevPath.empty() && prevPath == absoluteHtmlPath) {
+		obs_data_set_string(s, "local_file", "");
+		obs_source_update(src, s);
+	}
+	obs_data_set_bool(s, "is_local_file", true);
+	obs_data_set_string(s, "local_file", absoluteHtmlPath.c_str());
+
+	obs_data_set_bool(s, "is_control_audio", true);
+	obs_data_set_bool(s, "control_audio", true);
+	obs_data_set_bool(s, "reroute_audio", true);
+
+	obs_data_set_bool(s, "vflow_managed", true);
+	obs_data_set_int(s, "width", (int64_t)g_target_browser_width);
+	obs_data_set_int(s, "height", (int64_t)g_target_browser_height);
+	obs_source_update(src, s);
+
+	obs_data_release(s);
+
+	refreshSourceSettings(src);
+	obs_source_release(src);
+	return true;
+}
+
+bool rebuild_and_swap()
+{
+	if (!has_output_dir())
+		return false;
+
+	ensure_output_artifacts_exist();
+	ensure_parameters_files_from_api_templates();
+
+	const std::string ts = now_timestamp_string();
+	std::string cssFile, jsFile;
+	if (!regenerate_merged_css_js(ts, cssFile, jsFile))
+		return false;
+
+	const std::string newHtml = generate_bundle_html(ts, cssFile, jsFile);
+	if (newHtml.empty())
+		return false;
+
+
+	if (target_browser_source_exists()) {
+		swap_target_browser_source_to_file(newHtml);
+	} else {
+		if (g_target_browser_source.empty()) {
+			LOGW("Rebuilt artifacts but did not swap: no target Browser Source selected.");
+		} else {
+			LOGW("Rebuilt artifacts but did not swap: target Browser Source '%s' missing or not a Browser Source.",
+			     g_target_browser_source.c_str());
+		}
+	}
+
+	g_last_html_path = newHtml;
+	return true;
+}
+
+void notify_list_updated(const std::string &id)
+{
+	core_event l;
+	l.type = event_type::ListChanged;
+	l.reason = list_change_reason::Update;
+	l.id2 = id;
+	l.count = (int64_t)g_items.size();
+	emit_event(l);
+}
+
+bool reload_from_disk_and_rebuild()
+{
+	if (!has_output_dir())
+		return false;
+
+	ensure_output_artifacts_exist();
+
+	const bool okState = load_state_json();
+	const bool okVis = load_visible_json();
+	const bool okReb = rebuild_and_swap();
+	const bool ok = okState && okVis && okReb;
+
+	core_event r;
+	r.type = event_type::Reloaded;
+	r.ok = ok;
+	r.count = (int64_t)g_items.size();
+	emit_event(r);
+
+	core_event l;
+	l.type = event_type::ListChanged;
+	l.reason = list_change_reason::Reload;
+	l.count = (int64_t)g_items.size();
+	emit_event(l);
+
+	return ok;
+}
+
+bool set_output_dir_and_load(const std::string &dir)
+{
+	if (dir.empty())
+		return false;
+
+	g_output_dir = dir;
+	ensure_dir(output_dir());
+
+	save_global_config();
+
+	ensure_output_artifacts_exist();
+	load_state_json();
+	load_visible_json();
+
+	save_state_json();
+	save_visible_json();
+
+	const bool ok = rebuild_and_swap();
+
+	core_event l;
+	l.type = event_type::ListChanged;
+	l.reason = list_change_reason::Reload;
+	l.count = (int64_t)g_items.size();
+	emit_event(l);
+
+	return ok;
+}
+
+void init_from_disk()
+{
+	load_global_config();
+
+	if (g_output_dir.empty())
+		return;
+
+	ensure_dir(output_dir());
+	ensure_output_artifacts_exist();
+	load_state_json();
+	load_visible_json();
+
+	g_last_html_path = bundle_html_current_path();
+
+	if (!g_last_html_path.empty() && file_exists(g_last_html_path)) {
+		if (target_browser_source_exists()) {
+			swap_target_browser_source_to_file(g_last_html_path);
+		} else {
+			if (!g_target_browser_source.empty()) {
+				LOGW("Saved target Browser Source '%s' not found (startup swap skipped).",
+				     g_target_browser_source.c_str());
+			}
+		}
+	}
+}
+
+std::string add_default_group()
+{
+	if (!has_output_dir())
+		return {};
+
+	ensure_output_artifacts_exist();
+	load_state_json();
+
+	group_cfg c;
+	c.id = new_id();
+	while (get_group_by_id(c.id))
+		c.id = new_id();
+
+	int maxOrder = -1;
+	for (const auto &it : g_groups)
+		maxOrder = std::max(maxOrder, it.order);
+	c.order = maxOrder + 1;
+
+	c.title = "Group";
+	c.order_mode = 0;
+	c.loop = true;
+
+	c.visible_ms = 15000;
+	c.interval_ms = 5000;
+	c.dock_color = "#2EA043";
+
+	g_groups.push_back(c);
+	std::sort(g_groups.begin(), g_groups.end(), [](const group_cfg &a, const group_cfg &b) {
+		if (a.order != b.order)
+			return a.order < b.order;
+		return a.id < b.id;
+	});
+
+	save_state_json();
+
+	core_event l;
+	l.type = event_type::ListChanged;
+	l.reason = list_change_reason::Update;
+	l.id = c.id;
+	l.count = (int64_t)g_items.size();
+	emit_event(l);
+
+	return c.id;
+}
+
+bool update_group(const group_cfg &c)
+{
+	if (!has_output_dir())
+		return false;
+
+	ensure_output_artifacts_exist();
+	load_state_json();
+
+	group_cfg *dst = get_group_by_id(c.id);
+	if (!dst)
+		return false;
+
+	*dst = c;
+	if (dst->order_mode != 1)
+		dst->order_mode = 0;
+
+	for (const auto &mid : dst->members) {
+		if (auto *lt = get_by_id(mid)) {
+			lt->repeat_every_sec = 0;
+			lt->repeat_visible_sec = 0;
+		}
+	}
+	save_state_json();
+
+	core_event l;
+	l.type = event_type::ListChanged;
+	l.reason = list_change_reason::Update;
+	l.id = c.id;
+	l.count = (int64_t)g_items.size();
+	emit_event(l);
+
+	return true;
+}
+
+bool remove_group(const std::string &group_id)
+{
+	if (!has_output_dir())
+		return false;
+
+	ensure_output_artifacts_exist();
+	load_state_json();
+
+	const std::string sid = sanitize_id(group_id);
+	const auto before = g_groups.size();
+
+	g_groups.erase(std::remove_if(g_groups.begin(), g_groups.end(),
+					 [&](const group_cfg &c) { return c.id == sid; }),
+			  g_groups.end());
+
+	const bool removed = (g_groups.size() != before);
+	if (!removed)
+		return false;
+
+	save_state_json();
+
+	core_event l;
+	l.type = event_type::ListChanged;
+	l.reason = list_change_reason::Update;
+	l.id = sid;
+	l.count = (int64_t)g_items.size();
+	emit_event(l);
+
+	return true;
+}
+
+bool set_group_members(const std::string &group_id, const std::vector<std::string> &members)
+{
+	if (!has_output_dir())
+		return false;
+
+	ensure_output_artifacts_exist();
+	load_state_json();
+
+	group_cfg *c = get_group_by_id(group_id);
+	if (!c)
+		return false;
+
+	c->members.clear();
+	c->members.reserve(members.size());
+	for (const auto &m : members) {
+		const std::string mid = sanitize_id(m);
+		if (mid.empty())
+			continue;
+
+		bool ownedByOther = false;
+		for (const auto &other : g_groups) {
+			if (other.id == c->id)
+				continue;
+			if (std::find(other.members.begin(), other.members.end(), mid) != other.members.end()) {
+				ownedByOther = true;
+				break;
+			}
+		}
+		if (ownedByOther)
+			continue;
+
+		c->members.push_back(mid);
+
+		if (auto *lt = get_by_id(mid)) {
+			lt->repeat_every_sec = 0;
+			lt->repeat_visible_sec = 0;
+		}
+	}
+
+	save_state_json();
+
+	core_event l;
+	l.type = event_type::ListChanged;
+	l.reason = list_change_reason::Update;
+	l.id = c->id;
+	l.count = (int64_t)g_items.size();
+	emit_event(l);
+
+	return true;
+}
+
+std::string add_lower_third_with_style(int style_index)
+{
+	if (!has_output_dir())
+		return {};
+
+	ensure_output_artifacts_exist();
+	load_state_json();
+	load_visible_json();
+
+	lower_third_cfg c = style_variant(style_index);
+	while (get_by_id(c.id))
+		c.id = new_id();
+
+	int maxOrder = -1;
+	for (const auto &it : g_items)
+		maxOrder = std::max(maxOrder, it.order);
+	c.order = maxOrder + 1;
+	if (c.label.empty())
+		c.label = c.title.empty() ? c.id : c.title;
+
+	g_items.push_back(c);
+	std::sort(g_items.begin(), g_items.end(), [](const lower_third_cfg &a, const lower_third_cfg &b) {
+		if (a.order != b.order)
+			return a.order < b.order;
+		return a.id < b.id;
+	});
+	set_visible_nosave(c.id, true);
+
+	if (!save_state_json())
+		return {};
+	save_visible_json();
+
+	if (!rebuild_and_swap())
+		return {};
+
+	{
+		core_event l;
+		l.type = event_type::ListChanged;
+		l.reason = list_change_reason::Create;
+		l.id = c.id;
+		l.count = (int64_t)g_items.size();
+		emit_event(l);
+
+		core_event v;
+		v.type = event_type::VisibilityChanged;
+		v.id = c.id;
+		v.visible = true;
+		v.visible_ids = visible_ids();
+		emit_event(v);
+	}
+
+	return c.id;
+}
+
+std::string add_default_lower_third()
+{
+	return add_lower_third_with_style(0);
+}
+
+std::string clone_lower_third(const std::string &id)
+{
+	if (!has_output_dir())
+		return {};
+
+	ensure_output_artifacts_exist();
+	load_state_json();
+	load_visible_json();
+
+	const std::string sid = sanitize_id(id);
+	lower_third_cfg *src = get_by_id(sid);
+	if (!src)
+		return {};
+
+	lower_third_cfg c = *src;
+	c.id = new_id();
+	while (get_by_id(c.id))
+		c.id = new_id();
+
+	if (!c.title.empty())
+		c.title += " (Copy)";
+	else
+		c.title = "Lower Third (Copy)";
+
+	if (c.label.empty())
+		c.label = c.title;
+	else
+		c.label += " (Copy)";
+
+	if (!c.profile_picture.empty()) {
+		const std::string srcRel = c.profile_picture;
+		const std::string srcPath = output_dir() + "/" + srcRel;
+
+		std::string ext;
+		const auto dot = srcRel.find_last_of('.');
+		if (dot != std::string::npos && dot + 1 < srcRel.size())
+			ext = srcRel.substr(dot + 1);
+
+		using namespace std::chrono;
+		const auto ts = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+		std::string newName = c.id + "_" + std::to_string((long long)ts);
+		if (!ext.empty())
+			newName += "." + ext;
+
+		const std::string dstPath = output_dir() + "/" + newName;
+
+		std::error_code ec;
+		if (std::filesystem::exists(std::filesystem::path(srcPath), ec) && !ec) {
+			ec.clear();
+			std::filesystem::copy_file(std::filesystem::path(srcPath), std::filesystem::path(dstPath),
+						   std::filesystem::copy_options::overwrite_existing, ec);
+			if (!ec) {
+				c.profile_picture = newName;
+			} else {
+				LOGW("clone_lower_third: failed to copy profile picture '%s' -> '%s' (%d)",
+				     srcPath.c_str(), dstPath.c_str(), (int)ec.value());
+
+				c.profile_picture.clear();
+			}
+		} else {
+
+			c.profile_picture.clear();
+		}
+	}
+
+	int maxOrder = -1;
+	for (const auto &it : g_items)
+		maxOrder = std::max(maxOrder, it.order);
+	c.order = maxOrder + 1;
+
+	const std::string newId = c.id;
+
+	g_items.push_back(c);
+	std::sort(g_items.begin(), g_items.end(), [](const lower_third_cfg &a, const lower_third_cfg &b) {
+		if (a.order != b.order)
+			return a.order < b.order;
+		return a.id < b.id;
+	});
+	set_visible_nosave(newId, true);
+
+	if (!save_state_json())
+		return {};
+	save_visible_json();
+
+	if (!rebuild_and_swap())
+		return {};
+
+	{
+		core_event l;
+		l.type = event_type::ListChanged;
+		l.reason = list_change_reason::Clone;
+		l.id = sid;
+		l.id2 = newId;
+		l.count = (int64_t)g_items.size();
+		emit_event(l);
+
+		core_event v;
+		v.type = event_type::VisibilityChanged;
+		v.id = newId;
+		v.visible = true;
+		v.visible_ids = visible_ids();
+		emit_event(v);
+	}
+
+	return newId;
+}
+
+bool remove_lower_third(const std::string &id)
+{
+	if (!has_output_dir())
+		return false;
+
+	ensure_output_artifacts_exist();
+	load_state_json();
+	load_visible_json();
+
+	const std::string sid = sanitize_id(id);
+	const auto before = g_items.size();
+
+	std::string profileToDelete;
+	std::string animInSoundToDelete;
+	std::string animOutSoundToDelete;
+	for (const auto &c : g_items) {
+		if (c.id == sid) {
+			profileToDelete = c.profile_picture;
+			animInSoundToDelete = c.anim_in_sound;
+			animOutSoundToDelete = c.anim_out_sound;
+			break;
+		}
+	}
+
+	const bool wasVisible = is_visible(sid);
+
+	g_items.erase(std::remove_if(g_items.begin(), g_items.end(),
+				     [&](const lower_third_cfg &c) { return c.id == sid; }),
+		      g_items.end());
+
+	const bool removed = (g_items.size() != before);
+	if (!removed)
+		return false;
+
+	if (!profileToDelete.empty()) {
+		const std::string fullPath = output_dir() + "/" + profileToDelete;
+		std::error_code ec;
+		(void)std::filesystem::remove(std::filesystem::path(fullPath), ec);
+	}
+
+	if (!animInSoundToDelete.empty()) {
+		const std::string fullPath = output_dir() + "/" + animInSoundToDelete;
+		std::error_code ec;
+		(void)std::filesystem::remove(std::filesystem::path(fullPath), ec);
+	}
+	if (!animOutSoundToDelete.empty()) {
+		const std::string fullPath = output_dir() + "/" + animOutSoundToDelete;
+		std::error_code ec;
+		(void)std::filesystem::remove(std::filesystem::path(fullPath), ec);
+	}
+
+	set_visible_nosave(sid, false);
+
+	for (auto &car : g_groups) {
+		car.members.erase(std::remove(car.members.begin(), car.members.end(), sid), car.members.end());
+	}
+
+	save_state_json();
+	save_visible_json();
+
+	const bool ok = rebuild_and_swap();
+
+	{
+		core_event l;
+		l.type = event_type::ListChanged;
+		l.reason = list_change_reason::Delete;
+		l.id = sid;
+		l.count = (int64_t)g_items.size();
+		emit_event(l);
+
+		if (wasVisible) {
+			core_event v;
+			v.type = event_type::VisibilityChanged;
+			v.id = sid;
+			v.visible = false;
+			v.visible_ids = visible_ids();
+			emit_event(v);
+		}
+	}
+
+	return ok;
+}
+
+bool move_lower_third(const std::string &id, int delta)
+{
+	if (!has_output_dir())
+		return false;
+
+	ensure_output_artifacts_exist();
+	load_state_json();
+	load_visible_json();
+
+	const std::string sid = sanitize_id(id);
+	if (sid.empty())
+		return false;
+
+	if (g_items.size() < 2)
+		return false;
+
+	int idx = -1;
+	for (int i = 0; i < (int)g_items.size(); ++i) {
+		if (g_items[(size_t)i].id == sid) {
+			idx = i;
+			break;
+		}
+	}
+	if (idx < 0)
+		return false;
+
+	const int newIdx = idx + delta;
+	if (newIdx < 0 || newIdx >= (int)g_items.size())
+		return false;
+
+	std::swap(g_items[(size_t)idx], g_items[(size_t)newIdx]);
+	for (int i = 0; i < (int)g_items.size(); ++i)
+		g_items[(size_t)i].order = i;
+
+	if (!save_state_json())
+		return false;
+
+	core_event l;
+	l.type = event_type::ListChanged;
+	l.reason = list_change_reason::Update;
+	l.id = sid;
+	l.count = (int64_t)g_items.size();
+	emit_event(l);
+
+	return true;
+}
+
+bool sort_lower_thirds_by_group()
+{
+	if (!has_output_dir())
+		return false;
+
+	ensure_output_artifacts_exist();
+	load_state_json();
+	load_visible_json();
+
+	if (g_items.size() < 2)
+		return true;
+
+	std::unordered_map<std::string, int> group_rank;
+	group_rank.reserve(g_groups.size());
+	for (size_t gi = 0; gi < g_groups.size(); ++gi)
+		group_rank[g_groups[gi].id] = (int)gi;
+
+	struct item_sort {
+		lower_third_cfg cfg;
+		int original_index = 0;
+		bool grouped = false;
+		int group_order = INT_MAX / 2; 
+	};
+
+	std::vector<item_sort> tmp;
+	tmp.reserve(g_items.size());
+
+	for (int i = 0; i < (int)g_items.size(); ++i) {
+		item_sort t;
+		t.cfg = g_items[(size_t)i];
+		t.original_index = i;
+
+		const auto owners = groups_containing(t.cfg.id);
+		if (!owners.empty()) {
+			t.grouped = true;
+			auto it = group_rank.find(owners.front());
+			t.group_order = (it != group_rank.end()) ? it->second : INT_MAX / 2;
+		}
+
+		tmp.push_back(std::move(t));
+	}
+
+	std::stable_sort(tmp.begin(), tmp.end(), [](const item_sort &a, const item_sort &b) {
+		if (a.grouped != b.grouped)
+			return a.grouped > b.grouped; 
+
+		if (a.grouped && b.grouped) {
+			if (a.group_order != b.group_order)
+				return a.group_order < b.group_order;
+		}
+
+		return a.original_index < b.original_index;
+	});
+
+	for (size_t i = 0; i < tmp.size(); ++i) {
+		g_items[i] = std::move(tmp[i].cfg);
+		g_items[i].order = (int)i;
+	}
+
+	if (!save_state_json())
+		return false;
+
+	core_event l;
+	l.type = event_type::ListChanged;
+	l.reason = list_change_reason::Update;
+	l.id = "";
+	l.count = (int64_t)g_items.size();
+	emit_event(l);
+
+	return true;
+}
+
+} // namespace vflow
+
